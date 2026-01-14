@@ -6,16 +6,6 @@ An ffmpeg wrapper that helps you navigate the flags to save some space by compre
 - Python 3.8+ (script uses only the standard library)
 - ffmpeg and ffprobe installed and available on `PATH`
 
-Optional dependency:
-
-- `rich` (for prettier logging). The script will fall back to the stdlib logger if `rich` is not installed.
-
-Install with:
-
-```bash
-python3 -m pip install -r requirements.txt
-```
-
 On macOS, hardware acceleration uses VideoToolbox (`videotoolbox`) which requires an ffmpeg build with VideoToolbox support (brew-installed ffmpeg typically includes this).
 
 ## Quick Setup
@@ -74,6 +64,21 @@ python3 compress_buddy.py --chunk-minutes 15 -o /tmp/outdir long_video.mov
 - Chunking: segments are written to a temporary directory next to the output and moved into place after encoding. If the process fails mid-run, partial files may need manual cleanup.
 - Destructive flags: `--overwrite` and `--delete-original` will replace or remove files — use with caution.
 
+## Codec / Encoder selection
+
+- The flag `--codec` accepts high-level codec names and common synonyms. Use `--codec h264` or `--codec hevc` (or the familiar aliases `avc`, `x264`, `x265`). The script normalizes these to the internal canonical values `h264` or `h265`.
+- If you need to force a specific ffmpeg encoder token (for example, `hevc_videotoolbox`, `h264_nvenc`, or `hevc_qsv`), use `--force-encoder "<token>"`. The script will validate the token exists in your `ffmpeg -encoders` output before using it.
+
+Examples:
+
+```bash
+# use the high-level codec name (accepts synonyms)
+python3 compress_buddy.py --codec hevc myvideo.mov
+
+# force a specific ffmpeg encoder token (non-interactive)
+python3 compress_buddy.py --mode hardware --force-encoder hevc_videotoolbox myvideo.mov
+```
+
 ## Windows Notes
 
 - Verify ffmpeg/ffprobe availability:
@@ -120,6 +125,58 @@ python compress_buddy.py -o C:\tmp test.mp4
 
 - If you see errors about unknown encoders, install an ffmpeg build with the required encoders (e.g., `libx264`, `libx265`) or use your system package manager to get a fuller ffmpeg build.
 - To get more visibility into ffmpeg progress and script decisions, run with `--log-level DEBUG`.
+
+## Running ffmpeg at lower priority (`--nice`)
+
+You can request the child ffmpeg process be started with a lower CPU priority using `--nice N`. This helps keep encodes from interfering with interactive work.
+
+- Suggested niceness values:
+	- `5` — light background priority (small deprioritization)
+	- `10` — typical background priority
+	- `15` — very low priority (best for long unattended batch jobs)
+
+- Notes:
+	- On POSIX systems (macOS, Linux), `--nice` attempts to start ffmpeg with the requested niceness. Higher numbers mean lower priority.
+	- On Windows lowering process priority requires the optional `psutil` Python package. Install it with `pip install psutil` to enable priority lowering on Windows.
+
+Verification:
+
+On macOS/Linux you can verify niceness with:
+
+```bash
+# find the ffmpeg PID (example) and show niceness
+ps -o pid,ni,cmd -C ffmpeg
+
+# or watch during run
+top -o %CPU
+```
+
+On Windows, use Task Manager or PowerShell to inspect process priority:
+
+```powershell
+# list ffmpeg processes
+Get-Process ffmpeg | Select-Object Id,ProcessName,PriorityClass
+```
+
+## Limiting CPU usage and threads
+
+If an encode still uses too much CPU even with `--nice`, you can further limit ffmpeg:
+
+- `--threads N` passes `-threads N` to ffmpeg and is the simplest way to bound CPU usage from the encoder itself.
+
+Auto threads calculation:
+
+- If you run with `--workers > 1` and do not specify `--threads`, the tool will auto-calculate a conservative `threads` value per worker by dividing the logical CPU count by the number of workers (minimum 1). This avoids accidental CPU oversubscription when processing files in parallel.
+
+Examples:
+
+```bash
+# limit encoder threads to 4
+python3 compress_buddy.py --threads 4 myvideo.mov
+
+```
+
+
 
 ## Contributing / Fixes
 
