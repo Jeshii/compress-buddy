@@ -6,16 +6,6 @@ An ffmpeg wrapper that helps you navigate the flags to save some space by compre
 - Python 3.8+ (script uses only the standard library)
 - ffmpeg and ffprobe installed and available on `PATH`
 
-Optional dependency:
-
-- `rich` (for prettier logging). The script will fall back to the stdlib logger if `rich` is not installed.
-
-Install with:
-
-```bash
-python3 -m pip install -r requirements.txt
-```
-
 On macOS, hardware acceleration uses VideoToolbox (`videotoolbox`) which requires an ffmpeg build with VideoToolbox support (brew-installed ffmpeg typically includes this).
 
 ## Quick Setup
@@ -73,8 +63,6 @@ python3 compress_buddy.py --chunk-minutes 15 -o /tmp/outdir long_video.mov
 - Audio handling: if the input audio is AAC or you pass `--copy-audio`, audio will be copied. Otherwise it will be re-encoded to AAC at 128k.
 - Chunking: segments are written to a temporary directory next to the output and moved into place after encoding. If the process fails mid-run, partial files may need manual cleanup.
 - Destructive flags: `--overwrite` and `--delete-original` will replace or remove files — use with caution.
-- Logs include timezone-aware timestamps in the format `[YYYY/MM/DD HH:MM:SS ±HHMM]`
-- If `rich` is installed, logs will render bold/markup; otherwise markup tags are stripped for plain output.
 
 ## Windows Notes
 
