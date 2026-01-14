@@ -62,8 +62,6 @@ from pathlib import Path
 try:
     from rich.logging import RichHandler
 
-    HAVE_RICH = True
-
     def setup_logging(use_rich=True):
         fmt = "[%(asctime)s] %(levelname)s %(message)s"
         # include numeric timezone offset
@@ -92,7 +90,6 @@ try:
 
 except Exception:
     RichHandler = None
-    HAVE_RICH = False
 
     def setup_logging(use_rich=False):
         fmt = "[%(asctime)s] %(levelname)s %(message)s"
@@ -225,7 +222,7 @@ def choose_best_hw_encoder(preferred: str):
 
 
 def run_cmd(cmd):
-    LOG.debug("CMD: %s", format_cmd_for_logging(cmd))
+    LOG.debug(format_rich(f"CMD: {format_cmd_for_logging(cmd)}"))
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return res
 
@@ -356,7 +353,6 @@ def run_ffmpeg_with_progress(cmd, args):
 
 def process_file(path, args):
     inp = Path(path)
-    ensure_ffmpeg_available(getattr(args, "dry_run", False))
     # determine output path: if args.output is set and is a directory, place file there
     if getattr(args, "output", None):
         out_dir = Path(args.output)
@@ -591,16 +587,12 @@ def main(argv):
         chosen, hwaccel = choose_best_hw_encoder(args.encoder)
         if chosen:
             LOG.info("Auto-selected hardware encoder %s (hwaccel=%s)", chosen, hwaccel)
-            # map back to a simpler encoder token for behavior elsewhere
-            if "nvenc" in chosen:
-                args.encoder = chosen.replace("hevc", "h265").replace("h264", "h264")
-            else:
-                # keep encoder as-is for non-nvenc cases; process_file will append _videotoolbox or use mapping
-                args.encoder = chosen
+            # Use the exact encoder token returned by ffmpeg (e.g. 'hevc_nvenc').
+            args.encoder = chosen
             # if a hwaccel is required, store it on args for later use
             setattr(args, "_hwaccel", hwaccel)
         else:
-            LOG.info(
+            LOG.warning(
                 "No suitable hardware encoder found; falling back to software/CRF if requested"
             )
     if args.quality and args.mode == "crf":
@@ -614,6 +606,8 @@ def main(argv):
     # configure logging
     setup_logging()
     LOG.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
+
+    ensure_ffmpeg_available(getattr(args, "dry_run", False))
 
     files = args.files
     if args.workers > 1:
