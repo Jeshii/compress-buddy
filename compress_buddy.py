@@ -42,8 +42,13 @@ Examples:
     # split into 15-minute parts for sharing in Apple Photos:
     python3 compress_buddy.py --chunk-minutes 15 -o /tmp/outdir mylongvideo.mov
 
+    # output as AVI container:
+    python3 compress_buddy.py --suffix avi myvideo.mov
+
 """
 import argparse
+import ctypes
+import ctypes.util
 import json
 import logging
 import os
@@ -58,12 +63,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+
 def setup_logging():
     fmt = "[%(asctime)s] %(levelname)s %(message)s"
     datefmt = "%Y/%m/%d %H:%M:%S %z"
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
     logging.basicConfig(level=logging.INFO, handlers=[handler])
+
 
 LOG = logging.getLogger("compress_buddy")
 
@@ -132,6 +139,22 @@ def get_ffmpeg_encoders():
         return set()
 
 
+def get_ffmpeg_decoders():
+    """Return a set of decoder names reported by `ffmpeg -decoders`. Returns empty set on error."""
+    try:
+        res = run_cmd(["ffmpeg", "-hide_banner", "-decoders"])
+        if res.returncode != 0:
+            return set()
+        dec = set()
+        for line in res.stdout.splitlines():
+            m = re.match(r"^\s*[A-Z\.]+\s+(\S+)\s+", line)
+            if m:
+                dec.add(m.group(1))
+        return dec
+    except Exception:
+        return set()
+
+
 def choose_best_hw_encoder(preferred: str):
     """Given preferred codec ('h264' or 'h265'/'hevc'), return (encoder_name, hwaccel_or_None).
 
@@ -163,13 +186,50 @@ def choose_best_hw_encoder(preferred: str):
     encoders = get_ffmpeg_encoders()
     hwaccels = get_ffmpeg_hwaccels()
 
+    def nvenc_available():
+        # try to find and load libcuda; libcuda.so.1 is common
+        try:
+            lib = ctypes.util.find_library("cuda")
+            if lib:
+                ctypes.CDLL(lib)
+                return True
+            # try common soname
+            ctypes.CDLL("libcuda.so.1")
+            return True
+        except Exception:
+            # log debug detail about why libcuda couldn't be loaded
+            LOG.debug("nvenc runtime check: libcuda not loadable, will skip nvenc")
+            return False
+
+    have_nvenc = nvenc_available()
+
     for name, hw in candidates:
         if name in encoders:
-            # if encoder requires a hwaccel, ensure it's present (except nvenc which doesn't need -hwaccel)
+            # skip nvenc if CUDA / libcuda not available at runtime
+            if "nvenc" in name and not have_nvenc:
+                LOG.info(
+                    "Found %s encoder but libcuda not available at runtime; skipping nvenc",
+                    name,
+                )
+                continue
+            # if encoder requires a hwaccel, ensure it's present (nvenc typically doesn't need -hwaccel)
             if hw and hw not in hwaccels:
                 continue
             return name, hw
     return None, None
+
+
+def nvenc_runtime_available():
+    """Return True if libcuda appears loadable at runtime, False otherwise."""
+    try:
+        lib = ctypes.util.find_library("cuda")
+        if lib:
+            ctypes.CDLL(lib)
+            return True
+        ctypes.CDLL("libcuda.so.1")
+        return True
+    except Exception:
+        return False
 
 
 def run_cmd(cmd):
@@ -279,9 +339,7 @@ def run_ffmpeg_with_progress(cmd, args):
             err_chunk = proc.stderr.readline()
             if err_chunk:
                 stderr_lines.append(err_chunk)
-                LOG.debug(
-                    f"ffmpeg stderr: {err_chunk.strip()}"
-                )
+                LOG.debug(f"ffmpeg stderr: {err_chunk.strip()}")
         proc.wait()
     except KeyboardInterrupt:
         proc.kill()
@@ -338,6 +396,26 @@ def process_file(path, args):
         if s.get("codec_type") == "audio":
             audio_codec_name = s.get("codec_name")
             break
+
+    # Check whether the input video codec has any hardware decoder available
+    if has_video:
+        # determine codec_name for video
+        in_video_codec = None
+        for s in streams:
+            if s.get("codec_type") == "video":
+                in_video_codec = s.get("codec_name")
+                break
+        if in_video_codec:
+            # ffmpeg decoders are names like 'vp9', 'libvpx-vp9', 'vp9_qsv', 'vp9_cuvid'
+            decoders = get_ffmpeg_decoders()
+            hw_decoder_present = any(
+                d for d in decoders if in_video_codec in d and any(x in d for x in ("qsv", "cuvid", "nvdec", "v4l2m2m", "videotoolbox", "vaapi"))
+            )
+            if not hw_decoder_present:
+                LOG.warning(
+                    "Input codec '%s' appears to lack a hardware decoder on this system; this may limit encode speed (software decode).",
+                    in_video_codec,
+                )
 
     if args.dry_run:
         LOG.info(
@@ -428,8 +506,9 @@ def process_file(path, args):
             else:
                 cmd += ["-c:a", "aac", "-b:a", "128k"]
 
-        # always request faststart so progressive download / MOV compatibility is set
-        cmd += ["-movflags", "+faststart"]
+        # request faststart for MP4/MOV so progressive download compatibility is set
+        if getattr(args, "suffix", None) in ("mp4", "mov"):
+            cmd += ["-movflags", "+faststart"]
         # Request machine-parseable progress on stdout and suppress default tty stats
         cmd += ["-progress", "pipe:1", "-nostats"]
 
@@ -478,27 +557,21 @@ def process_file(path, args):
             # move all generated segments from tmp_dir to final names in out.parent
             seg_files = sorted(tmp_dir.glob(inp.stem + ".*" + out.suffix))
             if not seg_files:
-                LOG.error(
-                    f"No segments produced for {inp.name}"
-                )
+                LOG.error(f"No segments produced for {inp.name}")
             for idx, sf in enumerate(seg_files, start=1):
                 final_name = f"{inp.stem}_part{idx:03d}{out.suffix}"
                 final_path = out.parent / final_name
                 if final_path.exists() and not args.overwrite:
-                    LOG.warning(
-                        f"{final_path.name} exists, skipping"
-                    )
+                    LOG.warning(f"{final_path.name} exists, skipping")
                     continue
                 os.replace(sf, final_path)
                 LOG.info(
                     f"Created {final_path.name} ({final_path.stat().st_size / 1024 / 1024:.1f} MB)"
-                    )
+                )
         else:
             # Atomic replace
             os.replace(tmp_path, out)
-            LOG.info(
-                f"Created {out.name} ({out.stat().st_size / 1024 / 1024:.1f} MB)"
-            )
+            LOG.info(f"Created {out.name} ({out.stat().st_size / 1024 / 1024:.1f} MB)")
         LOG.info(f"Encode speed: {speed:.2f}x realtime")
         if args.delete_original:
             inp.unlink(missing_ok=True)
@@ -529,17 +602,47 @@ def main(argv):
     # If hardware mode requested, attempt to pick a suitable hw encoder if available
     if args.mode == "hardware":
         # try to auto-select best available hw encoder
-        chosen, hwaccel = choose_best_hw_encoder(args.encoder)
-        if chosen:
-            LOG.info("Auto-selected hardware encoder %s (hwaccel=%s)", chosen, hwaccel)
-            # Use the exact encoder token returned by ffmpeg (e.g. 'hevc_nvenc').
-            args.encoder = chosen
-            # if a hwaccel is required, store it on args for later use
-            setattr(args, "_hwaccel", hwaccel)
+        # If a user forced an exact encoder token, validate and use it
+        if getattr(args, "force_encoder", None):
+            forced = args.force_encoder
+            encs = get_ffmpeg_encoders()
+            if forced not in encs:
+                LOG.error("Requested forced encoder '%s' not available in this ffmpeg build.", forced)
+                LOG.error("Available encoders: %s", ", ".join(sorted(list(encs))[:40]) or "<none>")
+                sys.exit(1)
+            # if forcing nvenc, ensure runtime libcuda is present
+            if "nvenc" in forced and not nvenc_runtime_available():
+                LOG.error(
+                    "Forced encoder '%s' requires NVENC but libcuda cannot be loaded at runtime. Aborting.",
+                    forced,
+                )
+                sys.exit(1)
+            LOG.info("Using forced hardware encoder %s", forced)
+            args.encoder = forced
+            # try to infer a hwaccel from encoder token
+            if "qsv" in forced:
+                setattr(args, "_hwaccel", "qsv")
+            elif "videotoolbox" in forced:
+                setattr(args, "_hwaccel", "videotoolbox")
+            elif "vaapi" in forced:
+                setattr(args, "_hwaccel", "vaapi")
         else:
-            LOG.warning(
-                "No suitable hardware encoder found; falling back to software/CRF if requested"
-            )
+            chosen, hwaccel = choose_best_hw_encoder(args.encoder)
+            if chosen:
+                LOG.info("Auto-selected hardware encoder %s (hwaccel=%s)", chosen, hwaccel)
+                args.encoder = chosen
+                setattr(args, "_hwaccel", hwaccel)
+            else:
+                LOG.error(
+                    "No suitable hardware encoder found; no override provided. Aborting. Run with --mode crf for software encoding or --force-encoder to pick one."
+                )
+                encs = sorted(get_ffmpeg_encoders())
+                hw = sorted(get_ffmpeg_hwaccels())
+                decs = sorted(get_ffmpeg_decoders())
+                LOG.error("Detected encoders (sample): %s", ", ".join(encs[:40]) or "<none>")
+                LOG.error("Detected hwaccels: %s", ", ".join(hw) or "<none>")
+                LOG.error("Detected decoders (sample): %s", ", ".join(decs[:40]) or "<none>")
+                sys.exit(1)
     if args.quality and args.mode == "crf":
         LOG.info(f"Dividing quality {args.quality} by 2 for CRF")
     if args.mode == "crf" and not args.quality:
@@ -562,9 +665,7 @@ def main(argv):
                 try:
                     fut.result()
                 except Exception as e:
-                    LOG.error(
-                            f"Exception processing [bold]{futures[fut]}[/bold]: {e}"
-                    )
+                    LOG.error(f"Exception processing [bold]{futures[fut]}[/bold]: {e}")
     else:
         for f in files:
             try:
@@ -582,6 +683,12 @@ def arg_parse(argv):
     p.add_argument("--quality", type=int, default=None, help="Quality value (0-100)")
     p.add_argument(
         "--encoder", choices=("h264", "h265"), default="h265", help="encoder name"
+    )
+    p.add_argument(
+        "--force-encoder",
+        type=str,
+        default=None,
+        help="Force exact ffmpeg encoder token to use (e.g. hevc_videotoolbox, h264_nvenc). Overrides auto-selection.",
     )
     p.add_argument("--min-kbps", type=int, default=3000, help="min target kbps")
     p.add_argument("--max-kbps", type=int, default=8000, help="max target kbps")
@@ -618,7 +725,7 @@ def arg_parse(argv):
     )
     p.add_argument(
         "--suffix",
-        choices=("mp4", "mov", "mkv"),
+        choices=("mp4", "mov", "mkv", "avi"),
         default="mov",
         help="output file suffix (default mov)",
     )
