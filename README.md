@@ -158,6 +158,25 @@ On Windows, use Task Manager or PowerShell to inspect process priority:
 Get-Process ffmpeg | Select-Object Id,ProcessName,PriorityClass
 ```
 
+## Limiting CPU usage and threads
+
+If an encode still uses too much CPU even with `--nice`, you can further limit ffmpeg:
+
+- `--threads N` passes `-threads N` to ffmpeg and is the simplest way to bound CPU usage from the encoder itself.
+
+Auto threads calculation:
+
+- If you run with `--workers > 1` and do not specify `--threads`, the tool will auto-calculate a conservative `threads` value per worker by dividing the logical CPU count by the number of workers (minimum 1). This avoids accidental CPU oversubscription when processing files in parallel.
+
+Examples:
+
+```bash
+# limit encoder threads to 4
+python3 compress_buddy.py --threads 4 myvideo.mov
+
+```
+
+
 
 ## Contributing / Fixes
 
