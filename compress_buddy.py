@@ -65,35 +65,58 @@ try:
     HAVE_RICH = True
 
     def setup_logging(use_rich=True):
+        fmt = "[%(asctime)s] %(levelname)s %(message)s"
+        # include numeric timezone offset
+        datefmt = "%Y/%m/%d %H:%M:%S %z"
+        formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
+        global RICH_MARKUP_ENABLED
         if use_rich:
-            logging.basicConfig(
-                level=logging.INFO,
-                format="%(message)s",
-                handlers=[RichHandler(rich_tracebacks=True)],
-            )
+            handler = RichHandler(rich_tracebacks=True)
+            try:
+                # RichHandler may manage formatting internally; try to set formatter
+                handler.setFormatter(formatter)
+            except Exception:
+                pass
+            # Rich supports markup; enable tag passthrough
+            try:
+                setattr(handler, "rich_markup", True)
+                RICH_MARKUP_ENABLED = True
+            except Exception:
+                RICH_MARKUP_ENABLED = True
+            logging.basicConfig(level=logging.INFO, handlers=[handler])
         else:
-            logging.basicConfig(level=logging.INFO, format="%(message)s")
+            handler = logging.StreamHandler()
+            handler.setFormatter(formatter)
+            RICH_MARKUP_ENABLED = False
+            logging.basicConfig(level=logging.INFO, handlers=[handler])
 
 except Exception:
     RichHandler = None
     HAVE_RICH = False
 
     def setup_logging(use_rich=False):
-        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        fmt = "[%(asctime)s] %(levelname)s %(message)s"
+        datefmt = "%Y/%m/%d %H:%M:%S %z"
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
+        global RICH_MARKUP_ENABLED
+        RICH_MARKUP_ENABLED = False
+        logging.basicConfig(level=logging.INFO, handlers=[handler])
 
 
 LOG = logging.getLogger("compress_buddy")
 
+# whether the configured logging handler supports Rich markup rendering
+RICH_MARKUP_ENABLED = False
+
 
 def format_rich(text: str) -> str:
-    """Return `text` unchanged when rich is available, otherwise strip Rich-style tags.
+    """Return `text` unchanged when the configured logging handler supports Rich markup.
 
-    This allows code to emit strings containing [bold]...[/bold] and similar tags
-    but still produce plain output when `rich` is not installed.
+    Otherwise strip Rich-style tags so raw logs don't contain markup markers.
     """
-    if HAVE_RICH:
+    if RICH_MARKUP_ENABLED:
         return text
-    # naive strip of [tag] and [/tag] constructs
     return re.sub(r"\[/?[^\]]+\]", "", text)
 
 
