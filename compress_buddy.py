@@ -58,63 +58,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-# logging setup: try to use rich for pretty output, fall back to basic logging
-try:
-    from rich.logging import RichHandler
-
-    def setup_logging(use_rich=True):
-        fmt = "[%(asctime)s] %(levelname)s %(message)s"
-        # include numeric timezone offset
-        datefmt = "%Y/%m/%d %H:%M:%S %z"
-        formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
-        global RICH_MARKUP_ENABLED
-        if use_rich:
-            handler = RichHandler(rich_tracebacks=True)
-            try:
-                # RichHandler may manage formatting internally; try to set formatter
-                handler.setFormatter(formatter)
-            except Exception:
-                pass
-            # Rich supports markup; enable tag passthrough
-            try:
-                setattr(handler, "rich_markup", True)
-                RICH_MARKUP_ENABLED = True
-            except Exception:
-                RICH_MARKUP_ENABLED = True
-            logging.basicConfig(level=logging.INFO, handlers=[handler])
-        else:
-            handler = logging.StreamHandler()
-            handler.setFormatter(formatter)
-            RICH_MARKUP_ENABLED = False
-            logging.basicConfig(level=logging.INFO, handlers=[handler])
-
-except Exception:
-    RichHandler = None
-
-    def setup_logging(use_rich=False):
-        fmt = "[%(asctime)s] %(levelname)s %(message)s"
-        datefmt = "%Y/%m/%d %H:%M:%S %z"
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
-        global RICH_MARKUP_ENABLED
-        RICH_MARKUP_ENABLED = False
-        logging.basicConfig(level=logging.INFO, handlers=[handler])
-
+def setup_logging():
+    fmt = "[%(asctime)s] %(levelname)s %(message)s"
+    datefmt = "%Y/%m/%d %H:%M:%S %z"
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
 
 LOG = logging.getLogger("compress_buddy")
-
-# whether the configured logging handler supports Rich markup rendering
-RICH_MARKUP_ENABLED = False
-
-
-def format_rich(text: str) -> str:
-    """Return `text` unchanged when the configured logging handler supports Rich markup.
-
-    Otherwise strip Rich-style tags so raw logs don't contain markup markers.
-    """
-    if RICH_MARKUP_ENABLED:
-        return text
-    return re.sub(r"\[/?[^\]]+\]", "", text)
 
 
 def format_cmd_for_logging(cmd):
@@ -222,7 +173,7 @@ def choose_best_hw_encoder(preferred: str):
 
 
 def run_cmd(cmd):
-    LOG.debug(format_rich(f"CMD: {format_cmd_for_logging(cmd)}"))
+    LOG.debug(f"CMD: {format_cmd_for_logging(cmd)}")
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return res
 
@@ -305,7 +256,7 @@ def run_ffmpeg_with_progress(cmd, args):
     try:
         while True:
             out_line = proc.stdout.readline()
-            LOG.debug(format_rich(f"ffmpeg stdout: [bold]{out_line.strip()}[/bold]"))
+            LOG.debug(f"ffmpeg stdout: {out_line.strip()}")
             if out_line:
                 stdout_lines.append(out_line)
                 line = out_line.strip()
@@ -329,7 +280,7 @@ def run_ffmpeg_with_progress(cmd, args):
             if err_chunk:
                 stderr_lines.append(err_chunk)
                 LOG.debug(
-                    format_rich(f"ffmpeg stderr: [bold]{err_chunk.strip()}[/bold]")
+                    f"ffmpeg stderr: {err_chunk.strip()}"
                 )
         proc.wait()
     except KeyboardInterrupt:
@@ -504,24 +455,22 @@ def process_file(path, args):
 
         ffmpeg_command_message = "Running ffmpeg command: "
         cmd_str = format_cmd_for_logging(cmd)
-        ffmpeg_command_message += f"[bold]{cmd_str}[/bold]"
-        LOG.info(format_rich(ffmpeg_command_message))
+        ffmpeg_command_message += f"{cmd_str}"
+        LOG.info(ffmpeg_command_message)
 
         rc, _, stderr_text, speed = run_ffmpeg_with_progress(cmd, args)
         if rc != 0:
             err = stderr_text.strip().splitlines()
             tail = err[-10:] if err else ["<no stderr>"]
-            LOG.error(format_rich(f"ffmpeg failed for {inp.name}: {'\\n'.join(tail)}"))
+            LOG.error(f"ffmpeg failed for {inp.name}: {'\\n'.join(tail)}")
             try:
                 if tmp_path and tmp_path.exists():
                     tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
-            LOG.debug(format_rich(f"Full ffmpeg stderr:\n{stderr_text}"))
+            LOG.debug(f"Full ffmpeg stderr:\n{stderr_text}")
             LOG.debug(
-                format_rich(
-                    f"Full ffmpeg cmd: [bold]{' '.join(shlex.quote(x) for x in cmd)}[/bold]"
-                )
+                f"Full ffmpeg cmd: {' '.join(shlex.quote(x) for x in cmd)}"
             )
             return
 
@@ -530,34 +479,30 @@ def process_file(path, args):
             seg_files = sorted(tmp_dir.glob(inp.stem + ".*" + out.suffix))
             if not seg_files:
                 LOG.error(
-                    format_rich(f"No segments produced for [bold]{inp.name}[/bold]")
+                    f"No segments produced for {inp.name}"
                 )
             for idx, sf in enumerate(seg_files, start=1):
                 final_name = f"{inp.stem}_part{idx:03d}{out.suffix}"
                 final_path = out.parent / final_name
                 if final_path.exists() and not args.overwrite:
                     LOG.warning(
-                        format_rich(f"[bold]{final_path.name}[/bold] exists, skipping")
+                        f"{final_path.name} exists, skipping"
                     )
                     continue
                 os.replace(sf, final_path)
                 LOG.info(
-                    format_rich(
-                        f"Created [bold]{final_path.name}[/bold] ({final_path.stat().st_size / 1024 / 1024:.1f} MB)"
+                    f"Created {final_path.name} ({final_path.stat().st_size / 1024 / 1024:.1f} MB)"
                     )
-                )
         else:
             # Atomic replace
             os.replace(tmp_path, out)
             LOG.info(
-                format_rich(
-                    f"Created [bold]{out.name}[/bold] ({out.stat().st_size / 1024 / 1024:.1f} MB)"
-                )
+                f"Created {out.name} ({out.stat().st_size / 1024 / 1024:.1f} MB)"
             )
-        LOG.info(format_rich(f"Encode speed: [bold]{speed:.2f}x realtime[/bold]"))
+        LOG.info(f"Encode speed: {speed:.2f}x realtime")
         if args.delete_original:
             inp.unlink(missing_ok=True)
-            LOG.info(format_rich(f"Deleted original file [bold]{inp.name}[/bold]"))
+            LOG.info(f"Deleted original file {inp.name}")
     finally:
         # cleanup temp artifacts
         try:
@@ -618,16 +563,14 @@ def main(argv):
                     fut.result()
                 except Exception as e:
                     LOG.error(
-                        format_rich(
                             f"Exception processing [bold]{futures[fut]}[/bold]: {e}"
-                        )
                     )
     else:
         for f in files:
             try:
                 process_file(f, args)
             except Exception as e:
-                LOG.error(format_rich(f"Exception processing [bold]{f}[/bold]: {e}"))
+                LOG.error(f"Exception processing {f}: {e}")
 
 
 def arg_parse(argv):
