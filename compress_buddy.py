@@ -285,8 +285,7 @@ def run_ffmpeg_with_progress(cmd, args):
     try:
         while True:
             out_line = proc.stdout.readline()
-            if args.verbose:
-                LOG.debug("ffmpeg stdout: %s", out_line.strip())
+            LOG.debug(format_rich(f"ffmpeg stdout: [bold]{out_line.strip()}[/bold]"))
             if out_line:
                 stdout_lines.append(out_line)
                 line = out_line.strip()
@@ -309,6 +308,9 @@ def run_ffmpeg_with_progress(cmd, args):
             err_chunk = proc.stderr.readline()
             if err_chunk:
                 stderr_lines.append(err_chunk)
+                LOG.debug(
+                    format_rich(f"ffmpeg stderr: [bold]{err_chunk.strip()}[/bold]")
+                )
         proc.wait()
     except KeyboardInterrupt:
         proc.kill()
@@ -400,7 +402,7 @@ def process_file(path, args):
         cmd = build_common_base(
             inp,
             hardware_accel=hwaccel if args.mode == "hardware" else None,
-            error_level="info" if args.verbose else "error",
+            error_level=args.log_level.lower(),
         )
 
         if has_video:
