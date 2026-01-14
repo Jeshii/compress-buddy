@@ -301,14 +301,69 @@ def run_ffmpeg_with_progress(cmd, args):
     Returns (returncode, stdout_text, stderr_text, final_speed)
     """
     start = time.time()
+    full_cmd = list(cmd)
+    preexec = None
+    # On POSIX, we can set an exact niceness using preexec_fn so the child starts with lower priority.
+    if os.name != "nt" and getattr(args, "nice", None) is not None:
+        try:
+            nice_val = int(args.nice)
+
+            def _set_nice():
+                try:
+                    os.setpriority(os.PRIO_PROCESS, 0, nice_val)
+                except Exception:
+                    try:
+                        os.nice(nice_val)
+                    except Exception:
+                        pass
+
+            preexec = _set_nice
+            LOG.info("ffmpeg will be started with POSIX nice=%s", nice_val)
+        except Exception:
+            LOG.debug("Invalid nice value provided; ignoring")
+
     proc = subprocess.Popen(
-        cmd,
+        full_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
         universal_newlines=True,
+        preexec_fn=preexec,
     )
+
+    # If psutil is available, prefer to set niceness via psutil for more platform support (Windows)
+    if getattr(args, "nice", None) is not None:
+        try:
+            import psutil
+
+            p = psutil.Process(proc.pid)
+            try:
+                # On Unix this sets niceness; on Windows this accepts priority class constants.
+                p.nice(int(args.nice))
+                LOG.debug("Set process niceness via psutil to %s", args.nice)
+            except Exception:
+                # On Windows, map positive niceness to BELOW_NORMAL/IDLE classes
+                try:
+                    if platform.system() == "Windows":
+                        if int(args.nice) >= 10:
+                            p.nice(psutil.IDLE_PRIORITY_CLASS)
+                        else:
+                            p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+                        LOG.debug(
+                            "Set Windows process priority via psutil (mapped from nice %s)",
+                            args.nice,
+                        )
+                except Exception:
+                    LOG.debug(
+                        "psutil could not set niceness/priority for pid %s", proc.pid
+                    )
+        except Exception:
+            # psutil not available — we've already attempted preexec_fn on POSIX; on Windows we can't set priority.
+            if platform.system() == "Windows":
+                LOG.warning(
+                    "psutil not installed; cannot lower ffmpeg process priority on Windows. Install 'psutil' to enable this feature."
+                )
     final_out_time = 0.0
     stdout_lines = []
     stderr_lines = []
@@ -409,7 +464,20 @@ def process_file(path, args):
             # ffmpeg decoders are names like 'vp9', 'libvpx-vp9', 'vp9_qsv', 'vp9_cuvid'
             decoders = get_ffmpeg_decoders()
             hw_decoder_present = any(
-                d for d in decoders if in_video_codec in d and any(x in d for x in ("qsv", "cuvid", "nvdec", "v4l2m2m", "videotoolbox", "vaapi"))
+                d
+                for d in decoders
+                if in_video_codec in d
+                and any(
+                    x in d
+                    for x in (
+                        "qsv",
+                        "cuvid",
+                        "nvdec",
+                        "v4l2m2m",
+                        "videotoolbox",
+                        "vaapi",
+                    )
+                )
             )
             if not hw_decoder_present:
                 LOG.warning(
@@ -467,16 +535,16 @@ def process_file(path, args):
         if args.mode == "crf":
             cmd += [
                 "-c:v",
-                f"lib{args.encoder.replace('h', 'x')}",
+                f"lib{args.codec.replace('h', 'x')}",
                 "-preset",
                 "veryslow",
                 "-crf",
                 str(args.quality // 2),
             ]
         else:
-            # If args.encoder already contains a concrete encoder name (e.g., nvenc, qsv), use it as-is;
+            # If args.codec already contains a concrete encoder name (e.g., nvenc, qsv), use it as-is;
             # otherwise, attempt to use platform-specific hardware encoder naming.
-            enc = args.encoder
+            enc = args.codec
             # common encoder indicators
             if any(
                 k in enc for k in ("nvenc", "qsv", "videotoolbox", "d3d11va", "dxva2")
@@ -548,9 +616,7 @@ def process_file(path, args):
             except Exception:
                 pass
             LOG.debug(f"Full ffmpeg stderr:\n{stderr_text}")
-            LOG.debug(
-                f"Full ffmpeg cmd: {' '.join(shlex.quote(x) for x in cmd)}"
-            )
+            LOG.debug(f"Full ffmpeg cmd: {' '.join(shlex.quote(x) for x in cmd)}")
             return
 
         if chunking:
@@ -590,6 +656,20 @@ def process_file(path, args):
 def main(argv):
     args = arg_parse(argv)
 
+    # Normalize encoder synonyms to canonical 'h264'/'h265'
+    if args.codec:
+        enc_map = {
+            "size": "h265",
+            "compatibility": "h264",
+            "avc": "h264",
+            "x264": "h264",
+            "h264": "h264",
+            "hevc": "h265",
+            "x265": "h265",
+            "h265": "h265",
+        }
+        args.codec = enc_map.get(str(args.codec).lower(), args.codec)
+
     if args.mode == "hardware":
         if platform.system() == "Darwin":
             if args.workers != 1:
@@ -597,8 +677,8 @@ def main(argv):
                     "Hardware mode on macOS detected — capping workers to 1 for VideoToolbox stability"
                 )
             args.workers = 1
-    if args.mode == "hardware" and args.encoder == "h265":
-        args.encoder = "hevc"  # ffmpeg uses 'hevc' for h265 when using hwaccel
+    if args.mode == "hardware" and args.codec == "h265":
+        args.codec = "hevc"  # ffmpeg uses 'hevc' for h265 when using hwaccel
     # If hardware mode requested, attempt to pick a suitable hw encoder if available
     if args.mode == "hardware":
         # try to auto-select best available hw encoder
@@ -607,8 +687,14 @@ def main(argv):
             forced = args.force_encoder
             encs = get_ffmpeg_encoders()
             if forced not in encs:
-                LOG.error("Requested forced encoder '%s' not available in this ffmpeg build.", forced)
-                LOG.error("Available encoders: %s", ", ".join(sorted(list(encs))[:40]) or "<none>")
+                LOG.error(
+                    "Requested forced encoder '%s' not available in this ffmpeg build.",
+                    forced,
+                )
+                LOG.error(
+                    "Available encoders: %s",
+                    ", ".join(sorted(list(encs))[:40]) or "<none>",
+                )
                 sys.exit(1)
             # if forcing nvenc, ensure runtime libcuda is present
             if "nvenc" in forced and not nvenc_runtime_available():
@@ -618,7 +704,7 @@ def main(argv):
                 )
                 sys.exit(1)
             LOG.info("Using forced hardware encoder %s", forced)
-            args.encoder = forced
+            args.codec = forced
             # try to infer a hwaccel from encoder token
             if "qsv" in forced:
                 setattr(args, "_hwaccel", "qsv")
@@ -627,10 +713,12 @@ def main(argv):
             elif "vaapi" in forced:
                 setattr(args, "_hwaccel", "vaapi")
         else:
-            chosen, hwaccel = choose_best_hw_encoder(args.encoder)
+            chosen, hwaccel = choose_best_hw_encoder(args.codec)
             if chosen:
-                LOG.info("Auto-selected hardware encoder %s (hwaccel=%s)", chosen, hwaccel)
-                args.encoder = chosen
+                LOG.info(
+                    "Auto-selected hardware encoder %s (hwaccel=%s)", chosen, hwaccel
+                )
+                args.codec = chosen
                 setattr(args, "_hwaccel", hwaccel)
             else:
                 LOG.error(
@@ -639,9 +727,13 @@ def main(argv):
                 encs = sorted(get_ffmpeg_encoders())
                 hw = sorted(get_ffmpeg_hwaccels())
                 decs = sorted(get_ffmpeg_decoders())
-                LOG.error("Detected encoders (sample): %s", ", ".join(encs[:40]) or "<none>")
+                LOG.error(
+                    "Detected encoders (sample): %s", ", ".join(encs[:40]) or "<none>"
+                )
                 LOG.error("Detected hwaccels: %s", ", ".join(hw) or "<none>")
-                LOG.error("Detected decoders (sample): %s", ", ".join(decs[:40]) or "<none>")
+                LOG.error(
+                    "Detected decoders (sample): %s", ", ".join(decs[:40]) or "<none>"
+                )
                 sys.exit(1)
     if args.quality and args.mode == "crf":
         LOG.info(f"Dividing quality {args.quality} by 2 for CRF")
@@ -682,7 +774,19 @@ def arg_parse(argv):
     )
     p.add_argument("--quality", type=int, default=None, help="Quality value (0-100)")
     p.add_argument(
-        "--encoder", choices=("h264", "h265"), default="h265", help="encoder name"
+        "--codec",
+        choices=(
+            "h264",
+            "h265",
+            "avc",
+            "hevc",
+            "x264",
+            "x265",
+            "size",
+            "compatibility",
+        ),
+        default="h265",
+        help="codec to target (h264/avc or h265/hevc). Accepts common synonyms",
     )
     p.add_argument(
         "--force-encoder",
@@ -734,6 +838,16 @@ def arg_parse(argv):
         "--delete-original",
         action="store_true",
         help="delete original file after successful compression",
+    )
+    p.add_argument(
+        "--nice",
+        type=int,
+        default=None,
+        help=(
+            "Start ffmpeg with this niceness (POSIX). Higher values are lower priority. "
+            "Suggested values: 5 (light background), 10 (background), 15 (very low). "
+            "On Windows, lowering priority requires installing 'psutil'."
+        ),
     )
     args = p.parse_args(argv)
     return args
