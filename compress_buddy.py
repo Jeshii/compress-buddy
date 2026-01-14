@@ -565,6 +565,16 @@ def process_file(path, args):
                 ]
         cmd += ["-pix_fmt", "yuv420p"]
 
+        # allow limiting encoder threads
+        if getattr(args, "threads", None) is not None:
+            try:
+                t = int(args.threads)
+                if t > 0:
+                    cmd += ["-threads", str(t)]
+                    LOG.info("Passing -threads %s to ffmpeg", t)
+            except Exception:
+                LOG.warning("Invalid threads value, ignoring")
+
         # audio handling: prefer copying AAC if requested/available, otherwise encode to AAC
         if has_audio:
             if args.copy_audio or (
@@ -743,6 +753,21 @@ def main(argv):
         LOG.error("Quality must be between 0 and 100")
         sys.exit(1)
 
+    # Auto-calc `--threads` per worker when not explicitly provided.
+    # If multiple workers are used, divide available logical CPUs across workers.
+    if getattr(args, "threads", None) is None and getattr(args, "workers", 1) > 1:
+        try:
+            cores = os.cpu_count() or 1
+            per = max(1, cores // int(args.workers))
+            args.threads = per
+            # Defer informational logging until logging is configured; store a flag
+            setattr(args, "_threads_auto", True)
+            LOG.debug(
+                "Auto-setting --threads %s per worker (total CPU cores: %s)", per, cores
+            )
+        except Exception:
+            pass
+
     # configure logging
     setup_logging()
     LOG.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
@@ -849,6 +874,13 @@ def arg_parse(argv):
             "On Windows, lowering priority requires installing 'psutil'."
         ),
     )
+    p.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help="Pass `-threads N` to ffmpeg to limit encoder threads (helps bound CPU usage).",
+    )
+
     args = p.parse_args(argv)
     return args
 
