@@ -289,6 +289,8 @@ def compute_motion_multiplier(path, args):
     """
     try:
         # build ffmpeg command sampling up to sample_seconds (use -t to limit runtime)
+        # Downscale to a small width to speed up analysis while preserving motion characteristics
+        # Use scale=320:-2 to preserve aspect ratio
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -296,7 +298,7 @@ def compute_motion_multiplier(path, args):
             "-i",
             str(path),
             "-vf",
-            "tblend=all_expr=abs(A-B),signalstats",
+            "scale=320:-2,tblend=all_expr=abs(A-B),signalstats",
             "-t",
             str(int(args.sample_seconds)),
             "-f",
@@ -515,7 +517,7 @@ def run_ffmpeg_with_progress(cmd, args, total_duration=None):
                 import sys
 
                 sys.stderr.write(
-                    f"\r{pct_str} ETA {eta_str} | Encode speed: {speed_val:.2f}x realtime"
+                    f"\r{pct_str} ETA {eta_str} | Encode speed: {speed_val:.2f}x    "
                 )
                 sys.stderr.flush()
             except Exception:
@@ -690,6 +692,18 @@ def process_file(path, args):
             # If we're running in hardware mode with an explicit quality value (we'll use -q:v),
             # skip the motion-based bitrate adjustment because we're not targeting bitrate.
             try:
+                # Decide whether to run motion analysis. Always run when scaling is requested
+                # (we already adapt bitrate for scaling). Otherwise, auto-run only for long
+                # videos unless the user explicitly disables it with --skip-motion-analysis.
+                run_motion = False
+                if args.max_width is not None or args.max_height is not None:
+                    run_motion = True
+                else:
+                    if not getattr(args, "skip_motion_analysis", False) and (
+                        duration >= int(getattr(args, "motion_threshold_seconds", 120))
+                    ):
+                        run_motion = True
+
                 if (
                     args.mode == "hardware"
                     and getattr(args, "quality", None) is not None
@@ -698,8 +712,10 @@ def process_file(path, args):
                         "Hardware mode with explicit quality provided; skipping motion-based bitrate adjustment"
                     )
                     motion_mult = 1.0
-                else:
+                elif run_motion:
                     motion_mult = compute_motion_multiplier(inp, args)
+                else:
+                    motion_mult = 1.0
             except Exception:
                 motion_mult = 1.0
             scale_multiplier *= motion_mult
@@ -1296,6 +1312,17 @@ def arg_parse(argv):
         default=15,
         help="Number of seconds to sample for motion analysis (default 15s).",
     )
+    p.add_argument(
+        "--skip-motion-analysis",
+        action="store_true",
+        help="Do not run motion analysis even when auto-enabled for long videos",
+    )
+    p.add_argument(
+        "--motion-threshold-seconds",
+        type=int,
+        default=120,
+        help="Auto-run motion analysis for videos with duration >= this many seconds (default 120s)",
+    )
 
     args = p.parse_args(argv)
 
@@ -1331,6 +1358,9 @@ def arg_parse(argv):
 
     if args.sample_seconds <= 0:
         p.error("--sample-seconds must be a positive integer")
+
+    if args.motion_threshold_seconds is not None and args.motion_threshold_seconds < 0:
+        p.error("--motion-threshold-seconds must be >= 0")
 
     if args.workers <= 0:
         p.error("--workers must be a positive integer")
