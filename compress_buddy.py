@@ -1119,14 +1119,14 @@ def main(argv):
     if args.mode == "crf":
         if args.quality is None:
             # default user-facing quality chosen to correspond roughly to CRF~28
-            args.quality = 44
-            LOG.debug(
-                f"No quality provided for CRF; defaulting user-quality {args.quality}."
+            args.quality = 45
+            LOG.info(
+                f"No quality provided, defaulting to quality {args.quality} (CRF = {map_quality_to_crf(args.quality)})"
             )
         else:
             LOG.debug(f"User provided quality {args.quality} for CRF mode.")
     if args.quality and (args.quality < 0 or args.quality > 100):
-        LOG.error("Quality must be between 0 and 100. Aborting.")
+        LOG.error("Quality must be between 0 and 100, aborting.")
         sys.exit(1)
 
     # Auto-calc `--threads` per worker when not explicitly provided.
