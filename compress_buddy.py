@@ -99,7 +99,7 @@ def ensure_ffmpeg_available(dry_run: bool):
     ffprobe_path = shutil.which("ffprobe")
     if not ffmpeg_path or not ffprobe_path:
         LOG.error(
-            "ffmpeg and ffprobe must be available on PATH. See README for install instructions."
+            "ffmpeg and ffprobe must be available on PATH, see README for install instructions."
         )
         sys.exit(1)
 
@@ -110,7 +110,8 @@ def get_ffmpeg_hwaccels():
     Returns empty set on error.
     """
     try:
-        res = run_cmd(["ffmpeg", "-hide_banner", "-hwaccels"])
+        command = ["ffmpeg", "-hide_banner", "-hwaccels"]
+        res = run_cmd(command)
         if res.returncode != 0:
             return set()
         lines = res.stdout.splitlines()
@@ -131,7 +132,8 @@ def get_ffmpeg_encoders():
     Returns empty set on error.
     """
     try:
-        res = run_cmd(["ffmpeg", "-hide_banner", "-encoders"])
+        command = ["ffmpeg", "-hide_banner", "-encoders"]
+        res = run_cmd(command)
         if res.returncode != 0:
             return set()
         enc = set()
@@ -148,7 +150,8 @@ def get_ffmpeg_encoders():
 def get_ffmpeg_decoders():
     """Return a set of decoder names reported by `ffmpeg -decoders`. Returns empty set on error."""
     try:
-        res = run_cmd(["ffmpeg", "-hide_banner", "-decoders"])
+        command = ["ffmpeg", "-hide_banner", "-decoders"]
+        res = run_cmd(command)
         if res.returncode != 0:
             return set()
         dec = set()
@@ -214,7 +217,7 @@ def choose_best_hw_encoder(preferred: str):
             # skip nvenc if CUDA / libcuda not available at runtime
             if "nvenc" in name and not have_nvenc:
                 LOG.info(
-                    "Found %s encoder but libcuda not available at runtime; skipping nvenc",
+                    "Found %s encoder but libcuda not available at runtime, skipping nvenc",
                     name,
                 )
                 continue
@@ -239,7 +242,7 @@ def nvenc_runtime_available():
 
 
 def run_cmd(cmd):
-    LOG.debug(f"CMD: {format_cmd_for_logging(cmd)}")
+    LOG.info(f"Running command: {format_cmd_for_logging(cmd)}")
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return res
 
@@ -289,6 +292,8 @@ def compute_motion_multiplier(path, args):
     """
     try:
         # build ffmpeg command sampling up to sample_seconds (use -t to limit runtime)
+        # Downscale to a small width to speed up analysis while preserving motion characteristics
+        # Use scale=320:-2 to preserve aspect ratio
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -296,7 +301,7 @@ def compute_motion_multiplier(path, args):
             "-i",
             str(path),
             "-vf",
-            "tblend=all_expr=abs(A-B),signalstats",
+            "scale=320:-2,tblend=all_expr=abs(A-B),signalstats",
             "-t",
             str(int(args.sample_seconds)),
             "-f",
@@ -426,9 +431,9 @@ def run_ffmpeg_with_progress(cmd, args, total_duration=None):
                         pass
 
             preexec = _set_nice
-            LOG.info("ffmpeg will be started with POSIX nice=%s", nice_val)
+            LOG.info(f"ffmpeg will be started with POSIX nice={nice_val}")
         except Exception:
-            LOG.debug("Invalid nice value provided; ignoring")
+            LOG.debug("Invalid nice value provided, ignoring...")
 
     proc = subprocess.Popen(
         full_cmd,
@@ -449,7 +454,7 @@ def run_ffmpeg_with_progress(cmd, args, total_duration=None):
             try:
                 # On Unix this sets niceness; on Windows this accepts priority class constants.
                 p.nice(int(args.nice))
-                LOG.debug("Set process niceness via psutil to %s", args.nice)
+                LOG.debug(f"Set process niceness via psutil to {args.nice}")
             except Exception:
                 # On Windows, map positive niceness to BELOW_NORMAL/IDLE classes
                 try:
@@ -459,30 +464,34 @@ def run_ffmpeg_with_progress(cmd, args, total_duration=None):
                         else:
                             p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
                         LOG.debug(
-                            "Set Windows process priority via psutil (mapped from nice %s)",
-                            args.nice,
+                            f"Set Windows process priority via psutil (mapped from nice {args.nice})"
                         )
                 except Exception:
                     LOG.debug(
-                        "psutil could not set niceness/priority for pid %s", proc.pid
+                        f"psutil could not set niceness/priority for pid {proc.pid}"
                     )
         except Exception:
             # psutil not available — we've already attempted preexec_fn on POSIX; on Windows we can't set priority.
             if platform.system() == "Windows":
                 LOG.warning(
-                    "psutil not installed; cannot lower ffmpeg process priority on Windows. Install 'psutil' to enable this feature."
+                    "psutil not installed, cannot lower ffmpeg process priority on Windows, install 'psutil' to enable this feature, skipping..."
                 )
     final_out_time = 0.0
     stdout_lines = []
     stderr_lines = []
     # last time we wrote a live status line (throttle updates)
     last_status_write = 0.0
+    # last percent value printed (float 0.0-100.0), used to avoid regressing progress display
+    last_pct_printed = -1.0
     current_speed = 0.0
 
     try:
 
         def _compute_progress_fields(out_time_val, start_ts, total_dur):
-            """Return (pct_str, eta_text, current_speed) for given out_time in seconds."""
+            """Return (pct_str, eta_text, current_speed, pct_val) for given out_time in seconds.
+
+            pct_val is a float 0.0-100.0 when total_dur is known, otherwise None.
+            """
             try:
                 elapsed_now = max(1e-6, time.time() - start_ts)
                 current_speed_local = (
@@ -492,6 +501,7 @@ def run_ffmpeg_with_progress(cmd, args, total_duration=None):
                 current_speed_local = 0.0
             pct = "?"
             eta_txt = "?"
+            pct_val = None
             try:
                 if total_dur and total_dur > 0:
                     pct_val = min(100.0, (out_time_val / total_dur) * 100.0)
@@ -508,63 +518,56 @@ def run_ffmpeg_with_progress(cmd, args, total_duration=None):
                             eta_txt = f"{mins:02d}:{secs:02d}"
             except Exception:
                 pass
-            return pct, eta_txt, current_speed_local
+            return pct, eta_txt, current_speed_local, pct_val
 
         def _write_progress_line(pct_str, eta_str, speed_val):
             try:
                 import sys
 
                 sys.stderr.write(
-                    f"\r{pct_str} ETA {eta_str} | Encode speed: {speed_val:.2f}x realtime"
+                    f"\r{pct_str} ETA {eta_str} | Encode speed: {speed_val:.2f}x    "
                 )
                 sys.stderr.flush()
             except Exception:
                 pass
 
-        while True:
-            out_line = proc.stdout.readline()
+        def _handle_progress_line(out_line):
+            nonlocal final_out_time, last_status_write, last_pct_printed, current_speed
             LOG.debug(f"ffmpeg stdout: {out_line.strip()}")
-            if out_line:
-                stdout_lines.append(out_line)
-                line = out_line.strip()
-                if "=" in line:
-                    key, val = line.split("=", 1)
-                    if key == "out_time":
+            stdout_lines.append(out_line)
+            line = out_line.strip()
+            if "=" in line:
+                key, val = line.split("=", 1)
+                if key == "out_time":
+                    try:
                         final_out_time = parse_out_time(val.strip())
                         # compute current speed and update a single-line status (throttled)
-                        try:
-                            if time.time() - last_status_write > 0.5:
-                                pct, eta_txt, current_speed = _compute_progress_fields(
-                                    final_out_time, start, total_duration
-                                )
-                                _write_progress_line(pct, eta_txt, current_speed)
-                                last_status_write = time.time()
-                        except Exception:
-                            pass
+                        if time.time() - last_status_write > 0.5:
+                            pct, eta_txt, current_speed, pct_val = _compute_progress_fields(
+                            final_out_time, start, total_duration
+                            )
+                            try:
+                                if pct_val is None or pct_val >= last_pct_printed:
+                                    _write_progress_line(pct, eta_txt, current_speed)
+                                    if pct_val is not None:
+                                        last_pct_printed = pct_val
+                                    last_status_write = time.time()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+        while True:
+            out_line = proc.stdout.readline()
+            if out_line:
+                _handle_progress_line(out_line)
                 continue
             if proc.poll() is not None:
                 # drain remaining stdout
                 for out_line in proc.stdout:
-                    stdout_lines.append(out_line)
-                    line = out_line.strip()
-                    if "=" in line:
-                        key, val = line.split("=", 1)
-                        if key == "out_time":
-                            final_out_time = parse_out_time(val.strip())
-                            # compute current speed and update a single-line status (throttled)
-                            try:
-                                if time.time() - last_status_write > 0.5:
-                                    pct, eta_txt, current_speed = (
-                                        _compute_progress_fields(
-                                            final_out_time, start, total_duration
-                                        )
-                                    )
-                                    _write_progress_line(pct, eta_txt, current_speed)
-                                    last_status_write = time.time()
-                            except Exception:
-                                pass
+                    _handle_progress_line(out_line)
                 break
-            # drain a bit of stderr to avoid blocking if ffmpeg writes a lot
+                # drain a bit of stderr to avoid blocking if ffmpeg writes a lot
             err_chunk = proc.stderr.readline()
             if err_chunk:
                 stderr_lines.append(err_chunk)
@@ -615,22 +618,22 @@ def process_file(path, args):
     else:
         out = inp.with_suffix(f".{args.suffix}")
     if out.exists() and not args.overwrite:
-        LOG.warning("%s exists, skipping", out.name)
+        LOG.warning(f"{out.name} exists, skipping... (use --overwrite to replace)")
         return
 
     bitrate, duration, probe, bitrate_source = compute_bitrate_and_duration(inp)
     if bitrate is None:
         LOG.error(
-            "%s: ffprobe did not provide a source bitrate. Please re-run with --min-kbps and/or --max-kbps set to explicit values, or ensure ffprobe can read the file.",
-            inp.name,
+            f"{inp.name}: ffprobe did not provide a source bitrate. Please re-run with --min-kbps and/or --max-kbps set to explicit values or check the ffprobe output."
         )
         return
-    LOG.debug("Using source bitrate from: %s", bitrate_source or "unknown")
+    LOG.debug(f"Using source bitrate from: {bitrate_source or 'unknown'}")
     source_kbps = bitrate / 1000.0
     # compute raw target from the source bitrate and the target factor
     base_target = source_kbps * float(getattr(args, "target_factor", 0.7))
 
-    # If scaling is requested and we have stream info, adjust bitrate by pixel-area ratio
+    # Compute scale multiplier (default 1.0). We'll compute motion multiplier separately
+    # so motion analysis can run even when the user is not requesting scaling.
     scale_multiplier = 1.0
     try:
         video_stream = None
@@ -685,26 +688,38 @@ def process_file(path, args):
                 (f_out / f_in) ** temporal_exp if f_in and f_out else 1.0
             )
 
-            # motion multiplier: sample the file to detect high motion (sports)
-
-            # If we're running in hardware mode with an explicit quality value (we'll use -q:v),
-            # skip the motion-based bitrate adjustment because we're not targeting bitrate.
-            try:
-                if (
-                    args.mode == "hardware"
-                    and getattr(args, "quality", None) is not None
-                ):
-                    LOG.debug(
-                        "Hardware mode with explicit quality provided; skipping motion-based bitrate adjustment"
-                    )
-                    motion_mult = 1.0
-                else:
-                    motion_mult = compute_motion_multiplier(inp, args)
-            except Exception:
-                motion_mult = 1.0
-            scale_multiplier *= motion_mult
     except Exception:
         scale_multiplier = 1.0
+
+    # motion multiplier: sample the file to detect high motion (sports)
+    try:
+        # Decide whether to run motion analysis.
+        run_motion = False
+        # Always consider motion when scaling is requested (we already adapt bitrate for scaling)
+        if args.max_width is not None or args.max_height is not None:
+            run_motion = True
+        else:
+            if not getattr(args, "skip_motion_analysis", False) and (
+                duration >= int(getattr(args, "motion_threshold_seconds", 120))
+            ):
+                run_motion = True
+
+        if (
+            args.mode == "hardware"
+            and getattr(args, "quality", None) is not None
+        ):
+            LOG.debug(
+                "Hardware mode with explicit quality provided; skipping motion-based bitrate adjustment"
+            )
+            motion_mult = 1.0
+        elif run_motion:
+            motion_mult = compute_motion_multiplier(inp, args)
+        else:
+            motion_mult = 1.0
+    except Exception:
+        motion_mult = 1.0
+
+    scale_multiplier *= motion_mult
 
     # Prevent scale multiplier from becoming too small (aggressive downscale -> tiny target bitrate)
     try:
@@ -773,8 +788,7 @@ def process_file(path, args):
             )
             if not hw_decoder_present:
                 LOG.warning(
-                    "Input codec '%s' appears to lack a hardware decoder on this system; this may limit encode speed (software decode).",
-                    in_video_codec,
+                    f"Input codec '{in_video_codec}' appears to lack a hardware decoder on this system, falling back to software decoding..."
                 )
 
     if args.dry_run:
@@ -854,18 +868,16 @@ def process_file(path, args):
             available_encs = get_ffmpeg_encoders()
             if req_enc not in available_encs:
                 LOG.warning(
-                    "%s requested but not present in ffmpeg build; falling back to libx264",
-                    req_enc,
+                    f"{req_enc} requested but not present in ffmpeg build, falling back to libx264...",
                 )
                 # fall back to libx264
                 req_enc = "libx264"
                 if req_enc not in available_encs:
                     LOG.error(
-                        "Neither libx265 nor libx264 available in ffmpeg encoders: %s",
-                        ", ".join(sorted(list(available_encs))[:40]) or "<none>",
+                        f"Neither libx265 nor libx264 available in ffmpeg encoders: {', '.join(sorted(list(available_encs))[:40]) or '<none>'}",
                     )
                     LOG.error(
-                        "Aborting: no suitable software encoder found. Install x264/x265 or run in hardware mode."
+                        "no suitable software encoder found. Install x264/x265 or run in hardware mode. Aborting.",
                     )
                     try:
                         if tmp_path and tmp_path.exists():
@@ -915,7 +927,7 @@ def process_file(path, args):
                     cmd += ["-threads", str(t)]
                     LOG.info("Passing -threads %s to ffmpeg", t)
             except Exception:
-                LOG.warning("Invalid threads value, ignoring")
+                LOG.warning("Invalid threads value, ignoring...")
 
         # audio handling: prefer copying AAC if requested/available, otherwise encode to AAC
         if has_audio:
@@ -978,12 +990,12 @@ def process_file(path, args):
             # move all generated segments from tmp_dir to final names in out.parent
             seg_files = sorted(tmp_dir.glob(inp.stem + ".*" + out.suffix))
             if not seg_files:
-                LOG.error(f"No segments produced for {inp.name}")
+                LOG.error(f"No segments produced for {inp.name}. Aborting.")
             for idx, sf in enumerate(seg_files, start=1):
                 final_name = f"{inp.stem}_part{idx:03d}{out.suffix}"
                 final_path = out.parent / final_name
                 if final_path.exists() and not args.overwrite:
-                    LOG.warning(f"{final_path.name} exists, skipping")
+                    LOG.warning(f"{final_path.name} exists, skipping... (use --overwrite to replace)")
                     continue
                 os.replace(sf, final_path)
                 LOG.info(
@@ -1061,22 +1073,19 @@ def main(argv):
             encs = get_ffmpeg_encoders()
             if forced not in encs:
                 LOG.error(
-                    "Requested forced encoder '%s' not available in this ffmpeg build.",
-                    forced,
-                )
+                    f"Requested forced encoder {forced} not available in this ffmpeg build."
+                    )
                 LOG.error(
-                    "Available encoders: %s",
-                    ", ".join(sorted(list(encs))[:40]) or "<none>",
+                    f"Available encoders: {', '.join(sorted(list(encs))[:40]) or '<none>'}"
                 )
                 sys.exit(1)
             # if forcing nvenc, ensure runtime libcuda is present
             if "nvenc" in forced and not nvenc_runtime_available():
                 LOG.error(
-                    "Forced encoder '%s' requires NVENC but libcuda cannot be loaded at runtime. Aborting.",
-                    forced,
+                    f"Forced encoder {forced} requires NVENC but libcuda cannot be loaded at runtime. Aborting."
                 )
                 sys.exit(1)
-            LOG.info("Using forced hardware encoder %s", forced)
+            LOG.info(f"Using forced hardware encoder {forced}.")
             args.codec = forced
             # try to infer a hwaccel from encoder token
             if "qsv" in forced:
@@ -1088,9 +1097,7 @@ def main(argv):
         else:
             chosen, hwaccel = choose_best_hw_encoder(args.codec)
             if chosen:
-                LOG.info(
-                    "Auto-selected hardware encoder %s (hwaccel=%s)", chosen, hwaccel
-                )
+                LOG.info(f"Auto-selected hardware encoder {chosen} (hwaccel={hwaccel}).")
                 args.codec = chosen
                 setattr(args, "_hwaccel", hwaccel)
             else:
@@ -1101,25 +1108,25 @@ def main(argv):
                 hw = sorted(get_ffmpeg_hwaccels())
                 decs = sorted(get_ffmpeg_decoders())
                 LOG.error(
-                    "Detected encoders (sample): %s", ", ".join(encs[:40]) or "<none>"
+                    f"Detected encoders (sample): {', '.join(encs[:40]) or '<none>'}"
                 )
-                LOG.error("Detected hwaccels: %s", ", ".join(hw) or "<none>")
+                LOG.error(f"Detected hwaccels: {', '.join(hw) or '<none>'}")
                 LOG.error(
-                    "Detected decoders (sample): %s", ", ".join(decs[:40]) or "<none>"
+                    f"Detected decoders (sample): {', '.join(decs[:40]) or '<none>'}"
                 )
                 sys.exit(1)
     # For CRF mode, map 0-100 user quality to ffmpeg CRF (0-51, inverted mapping)
     if args.mode == "crf":
         if args.quality is None:
             # default user-facing quality chosen to correspond roughly to CRF~28
-            args.quality = 44
-            LOG.debug(
-                "No quality provided for CRF; defaulting user-quality %s", args.quality
+            args.quality = 45
+            LOG.info(
+                f"No quality provided, defaulting to quality {args.quality} (CRF = {map_quality_to_crf(args.quality)})"
             )
         else:
-            LOG.debug("User provided quality %s for CRF mode", args.quality)
+            LOG.debug(f"User provided quality {args.quality} for CRF mode.")
     if args.quality and (args.quality < 0 or args.quality > 100):
-        LOG.error("Quality must be between 0 and 100")
+        LOG.error("Quality must be between 0 and 100, aborting.")
         sys.exit(1)
 
     # Auto-calc `--threads` per worker when not explicitly provided.
@@ -1132,7 +1139,7 @@ def main(argv):
             # Defer informational logging until logging is configured; store a flag
             setattr(args, "_threads_auto", True)
             LOG.debug(
-                "Auto-setting --threads %s per worker (total CPU cores: %s)", per, cores
+                f"Auto-setting --threads {per} per worker (total CPU cores: {cores})"
             )
         except Exception:
             pass
@@ -1153,16 +1160,16 @@ def main(argv):
                         fut.result()
                     except Exception as e:
                         LOG.error(
-                            f"Exception processing [bold]{futures[fut]}[/bold]: {e}"
+                            f"Exception processing [bold]{futures[fut]}[/bold]: {e}."
                         )
         else:
             for f in files:
                 try:
                     process_file(f, args)
                 except Exception as e:
-                    LOG.error(f"Exception processing {f}: {e}")
+                    LOG.error(f"Exception processing {f}: {e}.")
     except KeyboardInterrupt:
-        LOG.warning("Keyboard interrupt received — stopping processing.")
+        LOG.error("Keyboard interrupt received, stopping program.")
         sys.exit(130)
 
 
@@ -1296,6 +1303,17 @@ def arg_parse(argv):
         default=15,
         help="Number of seconds to sample for motion analysis (default 15s).",
     )
+    p.add_argument(
+        "--skip-motion-analysis",
+        action="store_true",
+        help="Do not run motion analysis even when auto-enabled for long videos",
+    )
+    p.add_argument(
+        "--motion-threshold-seconds",
+        type=int,
+        default=120,
+        help="Auto-run motion analysis for videos with duration >= this many seconds (default 120s)",
+    )
 
     args = p.parse_args(argv)
 
@@ -1332,6 +1350,9 @@ def arg_parse(argv):
     if args.sample_seconds <= 0:
         p.error("--sample-seconds must be a positive integer")
 
+    if args.motion_threshold_seconds is not None and args.motion_threshold_seconds < 0:
+        p.error("--motion-threshold-seconds must be >= 0")
+
     if args.workers <= 0:
         p.error("--workers must be a positive integer")
 
@@ -1343,18 +1364,6 @@ def arg_parse(argv):
         except Exception:
             p.error("Invalid --quality value")
 
-        # Only warn about --sample-seconds being ignored if the user explicitly
-        # provided it on the command line.
-        sample_seconds_explicit = "--sample-seconds" in argv or any(
-            a.startswith("--sample-seconds=") for a in argv
-        )
-        if sample_seconds_explicit and args.mode == "hardware":
-            LOG.warning("--sample-seconds will be ignored when --quality is provided")
-        if args.max_kbps is not None or args.min_kbps is not None:
-            LOG.warning(
-                "--min-kbps and --max-kbps will be ignored when --quality is provided"
-            )
-
     return args
 
 
@@ -1362,5 +1371,5 @@ if __name__ == "__main__":
     try:
         main(sys.argv[1:])
     except KeyboardInterrupt:
-        LOG.warning("Interrupted by user — exiting.")
+        LOG.error("Interrupted by user, exiting program.")
         sys.exit(130)
