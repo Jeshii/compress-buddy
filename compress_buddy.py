@@ -963,7 +963,8 @@ def process_file(path, args):
         if rc != 0:
             err = stderr_text.strip().splitlines()
             tail = err[-10:] if err else ["<no stderr>"]
-            LOG.error(f"ffmpeg failed for {inp.name}: {'\\n'.join(tail)}")
+            tail_text = "\n".join(tail)
+            LOG.error(f"ffmpeg failed for {inp.name}: {tail_text}")
             try:
                 if tmp_path and tmp_path.exists():
                     tmp_path.unlink(missing_ok=True)
