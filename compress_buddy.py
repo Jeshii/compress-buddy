@@ -7,8 +7,8 @@ Usage:
 
 Options:
     --mode hardware|crf            Encode mode (hardware or CRF)
-    --quality N                    Quality value (0-100)
-    --encoder h264|h265            Encoder to use (h264 for compatibility, h265 for better compression)
+    --quality N                    Quality value, 0 being worst and 100 being best (default None)
+    --codec h264|h265              Codec to use (h264 for compatibility, h265 for better compression)
     --workers N                    Parallel workers (only for CRF mode)
     --min-kbps N                   Minimum target bitrate in kbps (default 3000)
     --max-kbps N                   Maximum target bitrate in kbps (default 8000)
@@ -16,10 +16,16 @@ Options:
     --overwrite                    Overwrite existing files
     --copy-audio                   Copy AAC audio instead of re-encoding
     --suffix mp4|mov|mkv           Output file suffix (default mov)
-    --scale                        Scale video down to max 1920x1080
+    --max-width N                  Maximum output width in pixels (preserves aspect)
+    --max-height N                 Maximum output height in pixels (preserves aspect)
     --delete-original              Delete original after successful encode
     --output /path/to/outdir       Place converted files into this directory
     --chunk-minutes N              Split output into N-minute chunks
+    --log-level LEVEL              Set log level (DEBUG, INFO, WARNING, ERROR)
+    --nice N                       Start ffmpeg with this niceness (POSIX)
+    --threads N                    Pass `-threads N` to ffmpeg to limit encoder threads
+    --force-encoder ENCODER        Force exact ffmpeg encoder token to use (e.g. hevc_videotoolbox, h264_nvenc)
+    --target-factor FACTOR         Target size factor relative to source bitrate (0.0 < FACTOR <= 1.0, default 0.7)
 
 Notes:
     - Requires ffmpeg and ffprobe in PATH.
@@ -255,23 +261,106 @@ def ffprobe_json(path):
     return json.loads(res.stdout)
 
 
+def _parse_signalstats_text(text, key="YAVG"):
+    """Parse signalstats output text and return list of floats for the given key per-frame."""
+    vals = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # lines look like: n:0 YMIN:0 YMAX:255 YAVG:0.123 ...
+        parts = line.split()
+        for p in parts:
+            if p.startswith(key + ":"):
+                try:
+                    v = float(p.split(":", 1)[1])
+                    vals.append(v)
+                except Exception:
+                    pass
+    return vals
+
+
+def compute_motion_multiplier(path, args):
+    """
+    Compute a motion multiplier based on per-frame absolute differences.
+
+    Returns a multiplier >= 1.0 (1.0 = normal), where higher values indicate more motion.
+    This runs a short ffmpeg pass that computes frame diffs and extracts YAVG via signalstats.
+    """
+    try:
+        # build ffmpeg command sampling up to sample_seconds (use -t to limit runtime)
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            str(path),
+            "-vf",
+            "tblend=all_expr=abs(A-B),signalstats",
+            "-t",
+            str(int(args.sample_seconds)),
+            "-f",
+            "null",
+            "-",
+        ]
+        LOG.info(f"Analyzing motion for {Path(path).name} (sampling {int(args.sample_seconds)}s)...")
+        LOG.debug(f"Running motion analysis command: {format_cmd_for_logging(cmd)}")
+        # run and capture stderr; signalstats writes stats to stderr
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stats_text = proc.stderr or ""
+        vals = _parse_signalstats_text(stats_text, key="YAVG")
+        if not vals:
+            return 1.0
+        # normalize by 255 (YAVG on 0-255 scale)
+        norm_vals = [v / 255.0 for v in vals]
+        # use median-ish summary (robust to spikes)
+        try:
+            import statistics
+
+            m = statistics.median(norm_vals)
+        except Exception:
+            # fallback to simple average
+            m = sum(norm_vals) / len(norm_vals)
+
+        # map median to multiplier: thresholds tuned heuristically
+        if m < 0.02:
+            mult = 1.0
+        elif m < 0.06:
+            mult = 1.3
+        else:
+            mult = 1.6
+        LOG.debug("Motion analysis: median_norm=%.4f -> multiplier=%.2f", m, mult)
+        return mult
+    except Exception:
+        LOG.debug("Motion analysis failed; defaulting multiplier to 1.0")
+        return 1.0
+
+
 def compute_bitrate_and_duration(path):
     info = ffprobe_json(path)
     duration = float(info.get("format", {}).get("duration") or 0.0)
     # prefer first video stream bit_rate
     bitrate = None
+    bitrate_source = None
     for s in info.get("streams", []):
         if s.get("codec_type") == "video" and s.get("bit_rate"):
-            bitrate = int(s["bit_rate"])
-            break
+            try:
+                bitrate = int(s["bit_rate"])
+                bitrate_source = "stream"
+                break
+            except Exception:
+                bitrate = None
+    # Fall back to container-level bit_rate (some formats like WebM/mkv store bitrate there)
     if not bitrate:
-        # fallback: use file size * 8 / duration (bps)
-        size_bytes = os.path.getsize(path)
-        if duration > 0:
-            bitrate = int(size_bytes * 8 / duration)
-        else:
-            bitrate = 5_000_000  # arbitrary fallback 5Mbps
-    return bitrate, duration, info
+        fmt_br = info.get("format", {}).get("bit_rate")
+        if fmt_br:
+            try:
+                bitrate = int(fmt_br)
+                bitrate_source = "format"
+            except Exception:
+                bitrate = None
+    # If still no bitrate, return None so caller can decide (we intentionally do not estimate from size/duration).
+    return bitrate, duration, info, bitrate_source
 
 
 def build_common_base(inp, hardware_accel=None, error_level="error"):
@@ -294,7 +383,22 @@ def parse_out_time(t):
         return 0.0
 
 
-def run_ffmpeg_with_progress(cmd, args):
+def map_quality_to_crf(q):
+    """Map a user-facing quality in 0-100 (100=best) to ffmpeg CRF 0-51 (0=best).
+
+    This performs a linear, inverted mapping where 100 -> 0 and 0 -> 51.
+    Values are clamped to the valid ranges.
+    """
+    try:
+        qv = int(q)
+    except Exception:
+        return 28
+    qv = max(0, min(100, qv))
+    crf = int(round((100 - qv) * 51.0 / 100.0))
+    return max(0, min(51, crf))
+
+
+def run_ffmpeg_with_progress(cmd, args, total_duration=None):
     """
     Run ffmpeg with '-progress pipe:1 -nostats' already present in cmd.
     Streams stdout, parses 'out_time' progress keys, and computes speed = out_time_secs / elapsed_secs.
@@ -367,8 +471,47 @@ def run_ffmpeg_with_progress(cmd, args):
     final_out_time = 0.0
     stdout_lines = []
     stderr_lines = []
+    # last time we wrote a live status line (throttle updates)
+    last_status_write = 0.0
+    current_speed = 0.0
 
     try:
+        def _compute_progress_fields(out_time_val, start_ts, total_dur):
+            """Return (pct_str, eta_text, current_speed) for given out_time in seconds."""
+            try:
+                elapsed_now = max(1e-6, time.time() - start_ts)
+                current_speed_local = out_time_val / elapsed_now if elapsed_now > 0 else 0.0
+            except Exception:
+                current_speed_local = 0.0
+            pct = "?"
+            eta_txt = "?"
+            try:
+                if total_dur and total_dur > 0:
+                    pct_val = min(100.0, (out_time_val / total_dur) * 100.0)
+                    pct = f"{pct_val:5.1f}%"
+                    if current_speed_local > 0:
+                        remaining = max(0.0, total_dur - out_time_val)
+                        eta_seconds = remaining / current_speed_local
+                        hrs = int(eta_seconds // 3600)
+                        mins = int((eta_seconds % 3600) // 60)
+                        secs = int(eta_seconds % 60)
+                        if hrs:
+                            eta_txt = f"{hrs}:{mins:02d}:{secs:02d}"
+                        else:
+                            eta_txt = f"{mins:02d}:{secs:02d}"
+            except Exception:
+                pass
+            return pct, eta_txt, current_speed_local
+
+        def _write_progress_line(pct_str, eta_str, speed_val):
+            try:
+                import sys
+
+                sys.stderr.write(f"\r{pct_str} ETA {eta_str} | Encode speed: {speed_val:.2f}x realtime")
+                sys.stderr.flush()
+            except Exception:
+                pass
+
         while True:
             out_line = proc.stdout.readline()
             LOG.debug(f"ffmpeg stdout: {out_line.strip()}")
@@ -379,6 +522,16 @@ def run_ffmpeg_with_progress(cmd, args):
                     key, val = line.split("=", 1)
                     if key == "out_time":
                         final_out_time = parse_out_time(val.strip())
+                        # compute current speed and update a single-line status (throttled)
+                        try:
+                            if time.time() - last_status_write > 0.5:
+                                pct, eta_txt, current_speed = _compute_progress_fields(
+                                    final_out_time, start, total_duration
+                                )
+                                _write_progress_line(pct, eta_txt, current_speed)
+                                last_status_write = time.time()
+                        except Exception:
+                            pass
                 continue
             if proc.poll() is not None:
                 # drain remaining stdout
@@ -389,6 +542,16 @@ def run_ffmpeg_with_progress(cmd, args):
                         key, val = line.split("=", 1)
                         if key == "out_time":
                             final_out_time = parse_out_time(val.strip())
+                            # compute current speed and update a single-line status (throttled)
+                            try:
+                                if time.time() - last_status_write > 0.5:
+                                    pct, eta_txt, current_speed = _compute_progress_fields(
+                                        final_out_time, start, total_duration
+                                    )
+                                    _write_progress_line(pct, eta_txt, current_speed)
+                                    last_status_write = time.time()
+                            except Exception:
+                                pass
                 break
             # drain a bit of stderr to avoid blocking if ffmpeg writes a lot
             err_chunk = proc.stderr.readline()
@@ -412,7 +575,17 @@ def run_ffmpeg_with_progress(cmd, args):
     except Exception:
         pass
 
-    return proc.returncode, "".join(stdout_lines), "".join(stderr_lines), final_speed
+    # clear the live status line we wrote to stderr
+    try:
+        import sys
+
+        sys.stderr.write("\r" + " " * 80 + "\r")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+    return proc.returncode, "".join(stdout_lines), "".join(stderr_lines), final_speed, elapsed, final_out_time
 
 
 def process_file(path, args):
@@ -428,9 +601,101 @@ def process_file(path, args):
         LOG.warning("%s exists, skipping", out.name)
         return
 
-    bitrate, duration, probe = compute_bitrate_and_duration(inp)
+    bitrate, duration, probe, bitrate_source = compute_bitrate_and_duration(inp)
+    if bitrate is None:
+        LOG.error(
+            "%s: ffprobe did not provide a source bitrate. Please re-run with --min-kbps and/or --max-kbps set to explicit values, or ensure ffprobe can read the file.",
+            inp.name,
+        )
+        return
+    LOG.debug("Using source bitrate from: %s", bitrate_source or "unknown")
     source_kbps = bitrate / 1000.0
-    target_kbps = int(max(args.min_kbps, min(args.max_kbps, source_kbps * 0.65)))
+    # compute raw target from the source bitrate and the target factor
+    base_target = source_kbps * float(getattr(args, "target_factor", 0.7))
+
+    # If scaling is requested and we have stream info, adjust bitrate by pixel-area ratio
+    scale_multiplier = 1.0
+    try:
+        video_stream = None
+        for s in probe.get("streams", []):
+            if s.get("codec_type") == "video":
+                video_stream = s
+                break
+        if (args.max_width is not None or args.max_height is not None) and video_stream:
+            in_w = int(video_stream.get("width") or 0)
+            in_h = int(video_stream.get("height") or 0)
+            # determine output dims based on provided max dimensions; infer missing dimension from input aspect
+            mw = args.max_width
+            mh = args.max_height
+            if in_w and in_h:
+                in_aspect = in_w / in_h
+                if mw is None and mh is not None:
+                    mw = int(mh * in_aspect)
+                elif mh is None and mw is not None:
+                    mh = int(mw / in_aspect)
+            mw = mw or 1920
+            mh = mh or 1080
+            out_w = min(in_w or mw, mw)
+            out_h = min(in_h or mh, mh)
+
+            area_in = max(1, in_w * in_h)
+            area_out = max(1, out_w * out_h)
+            r_spatial = area_out / area_in
+
+            # frame rate scaling (attempt to read fps)
+            def _parse_rational(r):
+                try:
+                    if not r:
+                        return 0.0
+                    if isinstance(r, (int, float)):
+                        return float(r)
+                    if "/" in str(r):
+                        num, den = str(r).split("/", 1)
+                        return float(num) / float(den) if float(den) != 0 else 0.0
+                    return float(r)
+                except Exception:
+                    return 0.0
+
+            f_in = _parse_rational(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate"))
+            f_out = f_in
+
+            spatial_exp = 0.9
+            temporal_exp = 1.0
+
+            scale_multiplier = (r_spatial ** spatial_exp) * ( (f_out / f_in) ** temporal_exp if f_in and f_out else 1.0 )
+
+            # motion multiplier: sample the file to detect high motion (sports)
+
+            # If we're running in hardware mode with an explicit quality value (we'll use -q:v),
+            # skip the motion-based bitrate adjustment because we're not targeting bitrate.
+            try:
+                if args.mode == "hardware" and getattr(args, "quality", None) is not None:
+                    LOG.debug(
+                        "Hardware mode with explicit quality provided; skipping motion-based bitrate adjustment"
+                    )
+                    motion_mult = 1.0
+                else:
+                    motion_mult = compute_motion_multiplier(inp, args)
+            except Exception:
+                motion_mult = 1.0
+            scale_multiplier *= motion_mult
+    except Exception:
+        scale_multiplier = 1.0
+
+    # Prevent scale multiplier from becoming too small (aggressive downscale -> tiny target bitrate)
+    try:
+        # floor at 0.5 to avoid producing unusably low target bitrates
+        if scale_multiplier < 0.5:
+            LOG.debug("scale_multiplier %.3f is below minimum; clamping to 0.5", scale_multiplier)
+            scale_multiplier = 0.5
+    except Exception:
+        pass
+
+    target_kbps = int(max(300, base_target * scale_multiplier))
+    if args.min_kbps is not None:
+        target_kbps = max(int(args.min_kbps), target_kbps)
+    if args.max_kbps is not None:
+        target_kbps = min(int(args.max_kbps), target_kbps)
     LOG.info(
         "%s: duration=%.1fs source=%.0f kbps -> target=%d kbps",
         inp.name,
@@ -527,19 +792,67 @@ def process_file(path, args):
         cmd += ["-map", "0:a?"]
         cmd += ["-map", "0:s?"]
 
-        # video settings
-        if args.scale:
-            vf = "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease"
+        # video settings: apply scaling if max width/height provided
+        if args.max_width is not None or args.max_height is not None:
+            # try to pick sensible partner dimension from probe to preserve aspect ratio
+            mw = args.max_width
+            mh = args.max_height
+            # find first video stream from probe
+            video_stream = None
+            for s in probe.get("streams", []):
+                if s.get("codec_type") == "video":
+                    video_stream = s
+                    break
+            if video_stream and (mw is None or mh is None):
+                try:
+                    in_w = int(video_stream.get("width") or 0)
+                    in_h = int(video_stream.get("height") or 0)
+                    if in_w and in_h:
+                        if mw is None and mh is not None:
+                            # compute mw from mh using input aspect
+                            mw = int(mh * (in_w / in_h))
+                        elif mh is None and mw is not None:
+                            mh = int(mw / (in_w / in_h))
+                except Exception:
+                    pass
+            mw = mw or 1920
+            mh = mh or 1080
+            vf = f"scale='min({mw},iw)':'min({mh},ih)':force_original_aspect_ratio=decrease"
             cmd += ["-vf", vf]
 
         if args.mode == "crf":
+            # choose encoder token for CRF mode: prefer requested (libx265/libx264), but
+            # fall back gracefully if encoder not present in this ffmpeg build.
+            req_enc = f"lib{args.codec.replace('h', 'x')}"
+            available_encs = get_ffmpeg_encoders()
+            if req_enc not in available_encs:
+                LOG.warning(
+                    "%s requested but not present in ffmpeg build; falling back to libx264",
+                    req_enc,
+                )
+                # fall back to libx264
+                req_enc = "libx264"
+                if req_enc not in available_encs:
+                    LOG.error(
+                        "Neither libx265 nor libx264 available in ffmpeg encoders: %s",
+                        ", ".join(sorted(list(available_encs))[:40]) or "<none>",
+                    )
+                    LOG.error("Aborting: no suitable software encoder found. Install x264/x265 or run in hardware mode.")
+                    try:
+                        if tmp_path and tmp_path.exists():
+                            tmp_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    return
+            crf_val = map_quality_to_crf(args.quality)
+            LOG.info("Using CRF=%s (mapped from quality=%s)", crf_val, args.quality)
             cmd += [
                 "-c:v",
-                f"lib{args.codec.replace('h', 'x')}",
+                req_enc,
                 "-preset",
                 "veryslow",
                 "-crf",
-                str(args.quality // 2),
+                str(crf_val),
             ]
         else:
             # If args.codec already contains a concrete encoder name (e.g., nvenc, qsv), use it as-is;
@@ -615,7 +928,9 @@ def process_file(path, args):
         ffmpeg_command_message += f"{cmd_str}"
         LOG.info(ffmpeg_command_message)
 
-        rc, _, stderr_text, speed = run_ffmpeg_with_progress(cmd, args)
+        rc, _, stderr_text, speed, elapsed_sec, final_out_time = run_ffmpeg_with_progress(
+            cmd, args, total_duration=duration
+        )
         if rc != 0:
             err = stderr_text.strip().splitlines()
             tail = err[-10:] if err else ["<no stderr>"]
@@ -649,6 +964,17 @@ def process_file(path, args):
             os.replace(tmp_path, out)
             LOG.info(f"Created {out.name} ({out.stat().st_size / 1024 / 1024:.1f} MB)")
         LOG.info(f"Encode speed: {speed:.2f}x realtime")
+        try:
+            hrs = int(elapsed_sec // 3600)
+            mins = int((elapsed_sec % 3600) // 60)
+            secs = int(elapsed_sec % 60)
+            if hrs:
+                elapsed_txt = f"{hrs}:{mins:02d}:{secs:02d}"
+            else:
+                elapsed_txt = f"{mins:02d}:{secs:02d}"
+            LOG.info("Total encode time: %s (encoded %.1fs of source)", elapsed_txt, final_out_time)
+        except Exception:
+            pass
         if args.delete_original:
             inp.unlink(missing_ok=True)
             LOG.info(f"Deleted original file {inp.name}")
@@ -679,6 +1005,9 @@ def main(argv):
             "h265": "h265",
         }
         args.codec = enc_map.get(str(args.codec).lower(), args.codec)
+
+    if args.mode == "software":
+        args.mode = "crf"
 
     if args.mode == "hardware":
         if platform.system() == "Darwin":
@@ -745,10 +1074,14 @@ def main(argv):
                     "Detected decoders (sample): %s", ", ".join(decs[:40]) or "<none>"
                 )
                 sys.exit(1)
-    if args.quality and args.mode == "crf":
-        LOG.info(f"Dividing quality {args.quality} by 2 for CRF")
-    if args.mode == "crf" and not args.quality:
-        args.quality = 28 * 2  # default CRF value doubled
+    # For CRF mode, map 0-100 user quality to ffmpeg CRF (0-51, inverted mapping)
+    if args.mode == "crf":
+        if args.quality is None:
+            # default user-facing quality chosen to correspond roughly to CRF~28
+            args.quality = 44
+            LOG.debug("No quality provided for CRF; defaulting user-quality %s", args.quality)
+        else:
+            LOG.debug("User provided quality %s for CRF mode", args.quality)
     if args.quality and (args.quality < 0 or args.quality > 100):
         LOG.error("Quality must be between 0 and 100")
         sys.exit(1)
@@ -775,29 +1108,33 @@ def main(argv):
     ensure_ffmpeg_available(getattr(args, "dry_run", False))
 
     files = args.files
-    if args.workers > 1:
-        with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futures = {ex.submit(process_file, f, args): f for f in files}
-            for fut in as_completed(futures):
+    try:
+        if args.workers > 1:
+            with ThreadPoolExecutor(max_workers=args.workers) as ex:
+                futures = {ex.submit(process_file, f, args): f for f in files}
+                for fut in as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        LOG.error(f"Exception processing [bold]{futures[fut]}[/bold]: {e}")
+        else:
+            for f in files:
                 try:
-                    fut.result()
+                    process_file(f, args)
                 except Exception as e:
-                    LOG.error(f"Exception processing [bold]{futures[fut]}[/bold]: {e}")
-    else:
-        for f in files:
-            try:
-                process_file(f, args)
-            except Exception as e:
-                LOG.error(f"Exception processing {f}: {e}")
+                    LOG.error(f"Exception processing {f}: {e}")
+    except KeyboardInterrupt:
+        LOG.warning("Keyboard interrupt received — stopping processing.")
+        sys.exit(130)
 
 
 def arg_parse(argv):
     p = argparse.ArgumentParser(description="Compress Buddy helps you compress videos")
     p.add_argument("files", nargs="+", help="input files")
     p.add_argument(
-        "--mode", choices=("hardware", "crf"), default="hardware", help="encode mode"
+        "--mode", choices=("hardware", "crf", "software"), default="hardware", help="encode mode"
     )
-    p.add_argument("--quality", type=int, default=None, help="Quality value (0-100)")
+    p.add_argument("--quality", type=int, default=None, help="Quality value, 0 being worst and 100 being best")
     p.add_argument(
         "--codec",
         choices=(
@@ -811,7 +1148,7 @@ def arg_parse(argv):
             "compatibility",
         ),
         default="h265",
-        help="codec to target (h264/avc or h265/hevc). Accepts common synonyms",
+        help="codec to target (h264/avc/compatibility or h265/hevc/size). 'h264' for compatibility, 'h265' for better compression.",
     )
     p.add_argument(
         "--force-encoder",
@@ -819,8 +1156,24 @@ def arg_parse(argv):
         default=None,
         help="Force exact ffmpeg encoder token to use (e.g. hevc_videotoolbox, h264_nvenc). Overrides auto-selection.",
     )
-    p.add_argument("--min-kbps", type=int, default=3000, help="min target kbps")
-    p.add_argument("--max-kbps", type=int, default=8000, help="max target kbps")
+    p.add_argument(
+        "--min-kbps",
+        type=int,
+        default=None,
+        help="min target kbps (optional). If not provided and ffprobe cannot determine source bitrate, the run will abort.",
+    )
+    p.add_argument(
+        "--max-kbps",
+        type=int,
+        default=None,
+        help="max target kbps (optional)",
+    )
+    p.add_argument(
+        "--target-factor",
+        type=float,
+        default=0.7,
+        help="Fraction of source bitrate to target (0.0 < factor <= 1.0). Default 0.7",
+    )
     p.add_argument(
         "--dry-run", action="store_true", help="show actions but don't run ffmpeg"
     )
@@ -858,7 +1211,18 @@ def arg_parse(argv):
         default="mov",
         help="output file suffix (default mov)",
     )
-    p.add_argument("--scale", action="store_true", help="scale video to max 1920x1080")
+    p.add_argument(
+        "--max-width",
+        type=int,
+        default=None,
+        help="Maximum output width in pixels (preserves aspect ratio).",
+    )
+    p.add_argument(
+        "--max-height",
+        type=int,
+        default=None,
+        help="Maximum output height in pixels (preserves aspect ratio).",
+    )
     p.add_argument(
         "--delete-original",
         action="store_true",
@@ -880,10 +1244,80 @@ def arg_parse(argv):
         default=None,
         help="Pass `-threads N` to ffmpeg to limit encoder threads (helps bound CPU usage).",
     )
+    p.add_argument(
+        "--sample-seconds",
+        type=int,
+        default=15,
+        help="Number of seconds to sample for motion analysis (default 15s).",
+    )
 
     args = p.parse_args(argv)
+
+    # Validate target factor
+    try:
+        tf = float(args.target_factor)
+        if not (0.0 < tf <= 1.0):
+            raise ValueError()
+    except Exception:
+        p.error("--target-factor must be a number > 0 and <= 1.0")
+
+    # Validate min/max if both provided
+    if args.min_kbps is not None and args.max_kbps is not None:
+        try:
+            if int(args.min_kbps) > int(args.max_kbps):
+                p.error("--min-kbps must be <= --max-kbps")
+        except Exception:
+            p.error("Invalid --min-kbps or --max-kbps value")
+
+    # Validate max width/height if provided
+    if args.max_width is not None:
+        try:
+            if int(args.max_width) <= 0:
+                p.error("--max-width must be a positive integer")
+        except Exception:
+            p.error("Invalid --max-width value")
+    if args.max_height is not None:
+        try:
+            if int(args.max_height) <= 0:
+                p.error("--max-height must be a positive integer")
+        except Exception:
+            p.error("Invalid --max-height value")
+
+    if args.sample_seconds <= 0:
+        p.error("--sample-seconds must be a positive integer")
+
+    if args.workers <= 0:
+        p.error("--workers must be a positive integer")
+
+    if args.quality is not None:
+        try:
+            q = int(args.quality)
+            if q < 0 or q > 100:
+                p.error("--quality must be between 0 and 100")
+        except Exception:
+            p.error("Invalid --quality value")
+
+        # Only warn about --sample-seconds being ignored if the user explicitly
+        # provided it on the command line.
+        sample_seconds_explicit = (
+            "--sample-seconds" in argv
+            or any(a.startswith("--sample-seconds=") for a in argv)
+        )
+        if sample_seconds_explicit and args.mode == "hardware":
+            LOG.warning(
+                "--sample-seconds will be ignored when --quality is provided"
+            )
+        if args.max_kbps is not None or args.min_kbps is not None:
+            LOG.warning(
+                "--min-kbps and --max-kbps will be ignored when --quality is provided"
+            )
+
     return args
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        LOG.warning("Interrupted by user — exiting.")
+        sys.exit(130)
