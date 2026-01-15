@@ -3,7 +3,7 @@ An ffmpeg wrapper that helps you navigate the flags to save some space by compre
 
 ## Requirements
 
-- Python 3.8+ (script uses only the standard library)
+- Python 3.8+ (uses only the standard library)
 - ffmpeg and ffprobe installed and available on `PATH`
 
 On macOS, hardware acceleration uses VideoToolbox (`videotoolbox`) which requires an ffmpeg build with VideoToolbox support (brew-installed ffmpeg typically includes this).
@@ -58,9 +58,14 @@ python3 compress_buddy.py --chunk-minutes 15 -o /tmp/outdir long_video.mov
 
 ## Important Notes & Gotchas
 
-- Quality mapping: `--quality` is a user-facing 0–100 scale. When using `--mode crf`, the script divides the provided `--quality` by 2 and uses that result as the CRF value passed to ffmpeg. Internally, the *default* CRF is stored as a doubled value (e.g., `56` represents a user quality of `28`), but you should always pass normal 0–100 values. For example, `--quality 28` results in `-crf 14` being sent to ffmpeg.
-- macOS + VideoToolbox: hardware mode uses VideoToolbox and the script forces `--workers 1` on Darwin for stability.
+- ffprobe is used to check for bitrates on the source. We prefer per-stream `bit_rate` when available and falls back to the container-level `format.bit_rate` for formats like WebM/Matroska. The target bitrate is computed as `source_kbps * --target-factor` (default 0.7). `--min-kbps` and `--max-kbps` are optional and, if provided, clamp the computed target. If ffprobe cannot determine a bitrate at all the tool will ask you to provide `--min-kbps` or `--max-kbps` explicitly rather than guessing from file size.
+- Quality mapping: `--quality` is a user-facing 0–100 scale, with 0 being worst and 100 being best. This is inverted in CRF mode automatically to keep things simple.
+- macOS + VideoToolbox: hardware mode uses VideoToolbox and we force `--workers 1` on Darwin for stability.
 - Audio handling: if the input audio is AAC or you pass `--copy-audio`, audio will be copied. Otherwise it will be re-encoded to AAC at 128k.
+- Scaling: use `--max-width` and/or `--max-height` to set the maximum output dimensions (we preserve aspect ratio). If you provide only one of the two, the other will be inferred from the input video's aspect ratio.
+- Motion analysis and bitrate scaling: when downscaling and not using `--quality`, we use a pixel-area ratio to scale the target bitrate so perceived quality is preserved. For high-motion content like sports, we run a short motion analysis pass (uses `tblend` + `signalstats`) to increase the bitrate multiplier. The motion sampling duration is configurable with `--sample-seconds` (default 15s).
+	- While motion analysis runs you will see an INFO message like "Analyzing motion for <file> (sampling 15s)..." so you know the tool is active.
+	- During encoding a single-line live status is shown that reports the current encode speed, percent complete (if duration known) and an ETA estimate.
 - Chunking: segments are written to a temporary directory next to the output and moved into place after encoding. If the process fails mid-run, partial files may need manual cleanup.
 - Destructive flags: `--overwrite` and `--delete-original` will replace or remove files — use with caution.
 
