@@ -303,10 +303,14 @@ def compute_motion_multiplier(path, args):
             "null",
             "-",
         ]
-        LOG.info(f"Analyzing motion for {Path(path).name} (sampling {int(args.sample_seconds)}s)...")
+        LOG.info(
+            f"Analyzing motion for {Path(path).name} (sampling {int(args.sample_seconds)}s)..."
+        )
         LOG.debug(f"Running motion analysis command: {format_cmd_for_logging(cmd)}")
         # run and capture stderr; signalstats writes stats to stderr
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
         stats_text = proc.stderr or ""
         vals = _parse_signalstats_text(stats_text, key="YAVG")
         if not vals:
@@ -476,11 +480,14 @@ def run_ffmpeg_with_progress(cmd, args, total_duration=None):
     current_speed = 0.0
 
     try:
+
         def _compute_progress_fields(out_time_val, start_ts, total_dur):
             """Return (pct_str, eta_text, current_speed) for given out_time in seconds."""
             try:
                 elapsed_now = max(1e-6, time.time() - start_ts)
-                current_speed_local = out_time_val / elapsed_now if elapsed_now > 0 else 0.0
+                current_speed_local = (
+                    out_time_val / elapsed_now if elapsed_now > 0 else 0.0
+                )
             except Exception:
                 current_speed_local = 0.0
             pct = "?"
@@ -507,7 +514,9 @@ def run_ffmpeg_with_progress(cmd, args, total_duration=None):
             try:
                 import sys
 
-                sys.stderr.write(f"\r{pct_str} ETA {eta_str} | Encode speed: {speed_val:.2f}x realtime")
+                sys.stderr.write(
+                    f"\r{pct_str} ETA {eta_str} | Encode speed: {speed_val:.2f}x realtime"
+                )
                 sys.stderr.flush()
             except Exception:
                 pass
@@ -545,8 +554,10 @@ def run_ffmpeg_with_progress(cmd, args, total_duration=None):
                             # compute current speed and update a single-line status (throttled)
                             try:
                                 if time.time() - last_status_write > 0.5:
-                                    pct, eta_txt, current_speed = _compute_progress_fields(
-                                        final_out_time, start, total_duration
+                                    pct, eta_txt, current_speed = (
+                                        _compute_progress_fields(
+                                            final_out_time, start, total_duration
+                                        )
                                     )
                                     _write_progress_line(pct, eta_txt, current_speed)
                                     last_status_write = time.time()
@@ -584,8 +595,14 @@ def run_ffmpeg_with_progress(cmd, args, total_duration=None):
     except Exception:
         pass
 
-
-    return proc.returncode, "".join(stdout_lines), "".join(stderr_lines), final_speed, elapsed, final_out_time
+    return (
+        proc.returncode,
+        "".join(stdout_lines),
+        "".join(stderr_lines),
+        final_speed,
+        elapsed,
+        final_out_time,
+    )
 
 
 def process_file(path, args):
@@ -656,20 +673,27 @@ def process_file(path, args):
                 except Exception:
                     return 0.0
 
-            f_in = _parse_rational(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate"))
+            f_in = _parse_rational(
+                video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate")
+            )
             f_out = f_in
 
             spatial_exp = 0.9
             temporal_exp = 1.0
 
-            scale_multiplier = (r_spatial ** spatial_exp) * ( (f_out / f_in) ** temporal_exp if f_in and f_out else 1.0 )
+            scale_multiplier = (r_spatial**spatial_exp) * (
+                (f_out / f_in) ** temporal_exp if f_in and f_out else 1.0
+            )
 
             # motion multiplier: sample the file to detect high motion (sports)
 
             # If we're running in hardware mode with an explicit quality value (we'll use -q:v),
             # skip the motion-based bitrate adjustment because we're not targeting bitrate.
             try:
-                if args.mode == "hardware" and getattr(args, "quality", None) is not None:
+                if (
+                    args.mode == "hardware"
+                    and getattr(args, "quality", None) is not None
+                ):
                     LOG.debug(
                         "Hardware mode with explicit quality provided; skipping motion-based bitrate adjustment"
                     )
@@ -686,7 +710,10 @@ def process_file(path, args):
     try:
         # floor at 0.5 to avoid producing unusably low target bitrates
         if scale_multiplier < 0.5:
-            LOG.debug("scale_multiplier %.3f is below minimum; clamping to 0.5", scale_multiplier)
+            LOG.debug(
+                "scale_multiplier %.3f is below minimum; clamping to 0.5",
+                scale_multiplier,
+            )
             scale_multiplier = 0.5
     except Exception:
         pass
@@ -837,7 +864,9 @@ def process_file(path, args):
                         "Neither libx265 nor libx264 available in ffmpeg encoders: %s",
                         ", ".join(sorted(list(available_encs))[:40]) or "<none>",
                     )
-                    LOG.error("Aborting: no suitable software encoder found. Install x264/x265 or run in hardware mode.")
+                    LOG.error(
+                        "Aborting: no suitable software encoder found. Install x264/x265 or run in hardware mode."
+                    )
                     try:
                         if tmp_path and tmp_path.exists():
                             tmp_path.unlink(missing_ok=True)
@@ -928,8 +957,8 @@ def process_file(path, args):
         ffmpeg_command_message += f"{cmd_str}"
         LOG.info(ffmpeg_command_message)
 
-        rc, _, stderr_text, speed, elapsed_sec, final_out_time = run_ffmpeg_with_progress(
-            cmd, args, total_duration=duration
+        rc, _, stderr_text, speed, elapsed_sec, final_out_time = (
+            run_ffmpeg_with_progress(cmd, args, total_duration=duration)
         )
         if rc != 0:
             err = stderr_text.strip().splitlines()
@@ -972,7 +1001,11 @@ def process_file(path, args):
                 elapsed_txt = f"{hrs}:{mins:02d}:{secs:02d}"
             else:
                 elapsed_txt = f"{mins:02d}:{secs:02d}"
-            LOG.info("Total encode time: %s (encoded %.1fs of source)", elapsed_txt, final_out_time)
+            LOG.info(
+                "Total encode time: %s (encoded %.1fs of source)",
+                elapsed_txt,
+                final_out_time,
+            )
         except Exception:
             pass
         if args.delete_original:
@@ -1079,7 +1112,9 @@ def main(argv):
         if args.quality is None:
             # default user-facing quality chosen to correspond roughly to CRF~28
             args.quality = 44
-            LOG.debug("No quality provided for CRF; defaulting user-quality %s", args.quality)
+            LOG.debug(
+                "No quality provided for CRF; defaulting user-quality %s", args.quality
+            )
         else:
             LOG.debug("User provided quality %s for CRF mode", args.quality)
     if args.quality and (args.quality < 0 or args.quality > 100):
@@ -1116,7 +1151,9 @@ def main(argv):
                     try:
                         fut.result()
                     except Exception as e:
-                        LOG.error(f"Exception processing [bold]{futures[fut]}[/bold]: {e}")
+                        LOG.error(
+                            f"Exception processing [bold]{futures[fut]}[/bold]: {e}"
+                        )
         else:
             for f in files:
                 try:
@@ -1132,9 +1169,17 @@ def arg_parse(argv):
     p = argparse.ArgumentParser(description="Compress Buddy helps you compress videos")
     p.add_argument("files", nargs="+", help="input files")
     p.add_argument(
-        "--mode", choices=("hardware", "crf", "software"), default="hardware", help="encode mode"
+        "--mode",
+        choices=("hardware", "crf", "software"),
+        default="hardware",
+        help="encode mode",
     )
-    p.add_argument("--quality", type=int, default=None, help="Quality value, 0 being worst and 100 being best")
+    p.add_argument(
+        "--quality",
+        type=int,
+        default=None,
+        help="Quality value, 0 being worst and 100 being best",
+    )
     p.add_argument(
         "--codec",
         choices=(
@@ -1299,14 +1344,11 @@ def arg_parse(argv):
 
         # Only warn about --sample-seconds being ignored if the user explicitly
         # provided it on the command line.
-        sample_seconds_explicit = (
-            "--sample-seconds" in argv
-            or any(a.startswith("--sample-seconds=") for a in argv)
+        sample_seconds_explicit = "--sample-seconds" in argv or any(
+            a.startswith("--sample-seconds=") for a in argv
         )
         if sample_seconds_explicit and args.mode == "hardware":
-            LOG.warning(
-                "--sample-seconds will be ignored when --quality is provided"
-            )
+            LOG.warning("--sample-seconds will be ignored when --quality is provided")
         if args.max_kbps is not None or args.min_kbps is not None:
             LOG.warning(
                 "--min-kbps and --max-kbps will be ignored when --quality is provided"
