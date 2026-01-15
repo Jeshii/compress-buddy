@@ -584,7 +584,7 @@ def run_ffmpeg_with_progress(cmd, args, total_duration=None):
     except Exception:
         pass
 
-    elapsed = max(1e-6, time.time() - start)
+
     return proc.returncode, "".join(stdout_lines), "".join(stderr_lines), final_speed, elapsed, final_out_time
 
 
@@ -665,7 +665,7 @@ def process_file(path, args):
             scale_multiplier = (r_spatial ** spatial_exp) * ( (f_out / f_in) ** temporal_exp if f_in and f_out else 1.0 )
 
             # motion multiplier: sample the file to detect high motion (sports)
-            # motion multiplier: sample the file to detect high motion (sports)
+
             # If we're running in hardware mode with an explicit quality value (we'll use -q:v),
             # skip the motion-based bitrate adjustment because we're not targeting bitrate.
             try:
@@ -865,7 +865,7 @@ def process_file(path, args):
                 cmd += ["-c:v", enc]
             else:
                 cmd += ["-c:v", f"{enc}_videotoolbox"]
-            if args.quality: # TODO: see if we need this during hw encoding and whether higher is better or worse
+            if args.quality:
                 cmd += ["-q:v", str(args.quality)]
             else:
                 cmd += [
@@ -1297,7 +1297,13 @@ def arg_parse(argv):
         except Exception:
             p.error("Invalid --quality value")
 
-        if args.sample_seconds and args.mode == "hardware":
+        # Only warn about --sample-seconds being ignored if the user explicitly
+        # provided it on the command line.
+        sample_seconds_explicit = (
+            "--sample-seconds" in argv
+            or any(a.startswith("--sample-seconds=") for a in argv)
+        )
+        if sample_seconds_explicit and args.mode == "hardware":
             LOG.warning(
                 "--sample-seconds will be ignored when --quality is provided"
             )
