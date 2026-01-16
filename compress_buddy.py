@@ -392,6 +392,75 @@ def parse_out_time(t):
         return 0.0
 
 
+def format_bytes(num_bytes):
+    """Format bytes into human-friendly string using KB/MB/GB with one decimal when appropriate.
+
+    If the size is >= 1.0 of the next unit, show in that unit (e.g., 1.5 GB instead of 1536.0 MB).
+    """
+    try:
+        num = float(num_bytes)
+    except Exception:
+        return "0 B"
+    # units
+    units = ["B", "KB", "MB", "GB", "TB"]
+    idx = 0
+    while num >= 1024.0 and idx < len(units) - 1:
+        num /= 1024.0
+        idx += 1
+    # use one decimal place for KB and above, bytes as integer
+    if idx == 0:
+        return f"{int(num)} {units[idx]}"
+    else:
+        return f"{num:.2f} {units[idx]}"
+
+
+def ring_bell():
+    """Write a terminal bell to stderr, ignoring errors."""
+    try:
+        import sys
+
+        sys.stderr.write("\a")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def log_created_single(name, orig_size, new_size):
+    """Log creation of a single-file output using format_bytes."""
+    try:
+        if orig_size and new_size is not None:
+            LOG.info(f"Created {name} ({format_bytes(orig_size)} -> {format_bytes(new_size)})")
+        elif new_size is not None:
+            LOG.info(f"Created {name} ({format_bytes(new_size)})")
+        else:
+            LOG.info(f"Created {name}")
+    except Exception:
+        LOG.info(f"Created {name}")
+
+
+def log_created_segment(name, new_size, orig_size, total_new_size):
+    """Log creation of a segment and an optional running total for chunked outputs."""
+    try:
+        if orig_size:
+            LOG.info(f"Created {name} ({format_bytes(new_size)}) ({format_bytes(orig_size)} -> {format_bytes(total_new_size)})")
+        else:
+            LOG.info(f"Created {name} ({format_bytes(new_size)})")
+    except Exception:
+        LOG.info(f"Created {name}")
+
+def log_total_segments(orig_size, out, total_new_size, created_count):
+    """Log total segments created for chunked outputs."""
+    try:
+        if orig_size:
+            LOG.info(
+                f"Created {created_count} segment(s) for {out.name} ({format_bytes(orig_size)} -> {format_bytes(total_new_size)})"
+            )
+        else:
+            LOG.info(f"Created {created_count} segment(s) for {out.name} (total {format_bytes(total_new_size)})")
+    except Exception:
+        LOG.info(f"Created {created_count} segment(s) for {out.name}")
+
+
 def map_quality_to_crf(q):
     """Map a user-facing quality in 0-100 (100=best) to ffmpeg CRF 0-51 (0=best).
 
@@ -610,6 +679,11 @@ def run_ffmpeg_with_progress(cmd, args, total_duration=None):
 
 def process_file(path, args):
     inp = Path(path)
+    # capture original size early for logging
+    try:
+        orig_size = inp.stat().st_size
+    except Exception:
+        orig_size = None
     # determine output path: if args.output is set and is a directory, place file there
     if getattr(args, "output", None):
         out_dir = Path(args.output)
@@ -719,6 +793,12 @@ def process_file(path, args):
     except Exception:
         motion_mult = 1.0
 
+    # Log the final motion multiplier for visibility
+    try:
+        LOG.info("Motion multiplier: %.2f", motion_mult)
+    except Exception:
+        pass
+
     scale_multiplier *= motion_mult
 
     # Prevent scale multiplier from becoming too small (aggressive downscale -> tiny target bitrate)
@@ -815,8 +895,9 @@ def process_file(path, args):
         LOG.debug("Segmenting into %s (chunk %dm)", tmp_pattern, chunk_minutes)
     else:
         # create a named temp file in the same directory as the output so atomic replace works across filesystems
+        # Use the output stem (name without suffix) as the prefix so the suffix is not duplicated
         with tempfile.NamedTemporaryFile(
-            prefix=out.name + ".", suffix=out.suffix, dir=str(out.parent), delete=False
+            prefix=out.stem + ".", suffix=out.suffix, dir=str(out.parent), delete=False
         ) as tf:
             tmp_path = Path(tf.name)
     try:
@@ -991,6 +1072,8 @@ def process_file(path, args):
             seg_files = sorted(tmp_dir.glob(inp.stem + ".*" + out.suffix))
             if not seg_files:
                 LOG.error(f"No segments produced for {inp.name}. Aborting.")
+            total_new_size = 0
+            created_count = 0
             for idx, sf in enumerate(seg_files, start=1):
                 final_name = f"{inp.stem}_part{idx:03d}{out.suffix}"
                 final_path = out.parent / final_name
@@ -998,13 +1081,26 @@ def process_file(path, args):
                     LOG.warning(f"{final_path.name} exists, skipping... (use --overwrite to replace)")
                     continue
                 os.replace(sf, final_path)
-                LOG.info(
-                    f"Created {final_path.name} ({final_path.stat().st_size / 1024 / 1024:.1f} MB)"
-                )
+                created_count += 1
+                new_sz = 0
+                try:
+                    new_sz = final_path.stat().st_size
+                except Exception:
+                    pass
+                total_new_size += new_sz
+                log_created_segment(final_path.name, new_sz, orig_size, total_new_size)
+            # summary for chunked output
+            if created_count:
+                log_total_segments(orig_size, out, total_new_size, created_count)
         else:
             # Atomic replace
             os.replace(tmp_path, out)
-            LOG.info(f"Created {out.name} ({out.stat().st_size / 1024 / 1024:.1f} MB)")
+            new_sz = None
+            try:
+                new_sz = out.stat().st_size
+            except Exception:
+                new_sz = None
+            log_created_single(out.name, orig_size, new_sz)
         LOG.info(f"Encode speed: {speed:.2f}x realtime")
         try:
             hrs = int(elapsed_sec // 3600)
@@ -1015,9 +1111,7 @@ def process_file(path, args):
             else:
                 elapsed_txt = f"{mins:02d}:{secs:02d}"
             LOG.info(
-                "Total encode time: %s (encoded %.1fs of source)",
-                elapsed_txt,
-                final_out_time,
+                f"Total encode time: {elapsed_txt} (encoded {final_out_time:.1f}s of source)"
             )
         except Exception:
             pass
@@ -1025,6 +1119,10 @@ def process_file(path, args):
             inp.unlink(missing_ok=True)
             LOG.info(f"Deleted original file {inp.name}")
     finally:
+        # ring terminal bell to notify completion of encode unless disabled
+        if not args.no_bell:
+            ring_bell()
+
         # cleanup temp artifacts
         try:
             if chunking and tmp_dir and tmp_dir.exists():
@@ -1313,6 +1411,11 @@ def arg_parse(argv):
         type=int,
         default=120,
         help="Auto-run motion analysis for videos with duration >= this many seconds (default 120s)",
+    )
+    p.add_argument(
+        "--no-bell",
+        action="store_true",
+        help="Do not ring terminal bell on completion",
     )
 
     args = p.parse_args(argv)
