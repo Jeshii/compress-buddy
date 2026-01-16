@@ -6,19 +6,19 @@ Usage:
     python3 compress_buddy.py [options] files...
 
 Options:
-    --mode hardware|crf            Encode mode (hardware or CRF)
+    --mode hardware|crf|software   Encode mode (hardware or CRF/software)
     --quality N                    Quality value, 0 being worst and 100 being best (default None)
     --codec h264|h265              Codec to use (h264 for compatibility, h265 for better compression)
     --workers N                    Parallel workers (only for CRF mode)
     --min-kbps N                   Minimum target bitrate in kbps (default 3000)
     --max-kbps N                   Maximum target bitrate in kbps (default 8000)
-    --dry-run                      Show actions but don't run ffmpeg
+    --dry-run                      Show actions but don't run final ffmpeg commands (will run some analysis)
     --overwrite                    Overwrite existing files
     --copy-audio                   Copy AAC audio instead of re-encoding
-    --suffix mp4|mov|mkv           Output file suffix (default mov)
+    --suffix mp4|mov|mkv|avi       Output file suffix (default mov)
     --max-width N                  Maximum output width in pixels (preserves aspect)
     --max-height N                 Maximum output height in pixels (preserves aspect)
-    --delete-original              Delete original after successful encode
+    --delete-original              Delete original after successful encode (use with caution)
     --output /path/to/outdir       Place converted files into this directory
     --chunk-minutes N              Split output into N-minute chunks
     --log-level LEVEL              Set log level (DEBUG, INFO, WARNING, ERROR)
@@ -26,6 +26,9 @@ Options:
     --threads N                    Pass `-threads N` to ffmpeg to limit encoder threads
     --force-encoder ENCODER        Force exact ffmpeg encoder token to use (e.g. hevc_videotoolbox, h264_nvenc)
     --target-factor FACTOR         Target size factor relative to source bitrate (0.0 < FACTOR <= 1.0, default 0.7)
+    --motion-multiplier MULT       Motion multiplier to adjust bitrate (default 1.0)
+    --motion-threshold-seconds N   Only run motion analysis if video is at least N seconds long (default 0)
+
 
 Notes:
     - Requires ffmpeg and ffprobe in PATH.
@@ -264,85 +267,200 @@ def ffprobe_json(path):
     return json.loads(res.stdout)
 
 
-def _parse_signalstats_text(text, key="YAVG"):
-    """Parse signalstats output text and return list of floats for the given key per-frame."""
-    vals = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        # lines look like: n:0 YMIN:0 YMAX:255 YAVG:0.123 ...
-        parts = line.split()
-        for p in parts:
-            if p.startswith(key + ":"):
-                try:
-                    v = float(p.split(":", 1)[1])
-                    vals.append(v)
-                except Exception:
-                    pass
-    return vals
-
-
-def compute_motion_multiplier(path, args):
+def motion_analysis(
+    video_path: Path,
+    sample_rate: int = 10,
+) -> dict:
     """
-    Compute a motion multiplier based on per-frame absolute differences.
+    Analyze video motion using ffmpeg's signalstats filter to measure frame differences.
 
-    Returns a multiplier >= 1.0 (1.0 = normal), where higher values indicate more motion.
-    This runs a short ffmpeg pass that computes frame diffs and extracts YAVG via signalstats.
+    Args:
+        video_path: Path to input video file
+        sample_rate: Analyze every Nth frame (10 = analyze ~10% of frames for speed)
+
+    Returns:
+        dict with keys:
+            - 'multiplier': float between 1.0 and 1.6 (bitrate scaling factor)
+            - 'motion_level': str ('low', 'medium', 'high')
+            - 'avg_motion': float (average frame-to-frame difference 0-255)
+            - 'peak_motion': float (maximum frame-to-frame difference)
+            - 'frame_count': int (total frames analyzed)
     """
+
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+
+    LOG.info(f"Analyzing motion in: {video_path}")
+    LOG.info(f"Sample rate: every {sample_rate}th frame")
+
+    import re
+
+    slash_comma = r"""\,"""
+    filters_to_try = [f"select='not(mod(n{slash_comma}{sample_rate}))',signalstats", f"fps=1/{sample_rate},signalstats"]
+    ydif_re = re.compile(r"YDIF\s*[:=]\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
+
+    motion_values = []
+    frame_count = 0
+    stderr_lines = []
+
     try:
-        # build ffmpeg command sampling up to sample_seconds (use -t to limit runtime)
-        # Downscale to a small width to speed up analysis while preserving motion characteristics
-        # Use scale=320:-2 to preserve aspect ratio
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-nostats",
-            "-i",
-            str(path),
-            "-vf",
-            "scale=320:-2,tblend=all_expr=abs(A-B),signalstats",
-            "-t",
-            str(int(args.sample_seconds)),
-            "-f",
-            "null",
-            "-",
-        ]
-        LOG.info(
-            f"Analyzing motion for {Path(path).name} (sampling {int(args.sample_seconds)}s)..."
-        )
-        LOG.debug(f"Running motion analysis command: {format_cmd_for_logging(cmd)}")
-        # run and capture stderr; signalstats writes stats to stderr
-        proc = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-        stats_text = proc.stderr or ""
-        vals = _parse_signalstats_text(stats_text, key="YAVG")
-        if not vals:
+        # Try signalstats with a couple of sampling filter variants
+        for vf in filters_to_try:
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-i",
+                str(video_path),
+                "-vf",
+                vf,
+                "-frames:v",
+                "60",
+                "-f",
+                "null",
+                "-",
+            ]
+            LOG.debug("Running ffmpeg for motion sampling with filter: %s", vf)
+            result = run_cmd(ffmpeg_cmd)
+            stderr_lines = result.stderr.splitlines()
+
+            for line in stderr_lines:
+                m = ydif_re.search(line)
+                if m:
+                    try:
+                        ydif = float(m.group(1))
+                        motion_values.append(ydif)
+                        frame_count += 1
+                        LOG.debug("Frame %d: YDIF=%.2f", frame_count, ydif)
+                    except ValueError:
+                        LOG.warning("Could not parse numeric YDIF from line: %s", line)
+
+            if motion_values:
+                break
+
+        # Loose heuristic: look for any Y*DIF-like token then any number on the same line
+        if not motion_values:
+            loose_re = re.compile(r"\bY[A-Z0-9_]*DIF[A-Z0-9_]*\b", re.IGNORECASE)
+            num_re = re.compile(r"([+-]?\d+(?:\.\d+)?)")
+            for line in stderr_lines:
+                if loose_re.search(line):
+                    num_m = num_re.search(line)
+                    if num_m:
+                        try:
+                            ydif = float(num_m.group(1))
+                            motion_values.append(ydif)
+                            frame_count += 1
+                            LOG.debug("(loose) Frame %d: YDIF=%.2f", frame_count, ydif)
+                        except ValueError:
+                            continue
+
+        # Fallback: try an ffmpeg-only pipeline that computes per-sample-frame differences
+        # using tblend=all_mode=difference then signalstats on the resulting diff frames.
+        if not motion_values:
+            LOG.info("signalstats produced no YDIF tokens; attempting ffmpeg-only tblend+signalstats fallback")
+            ffmpeg_diff_cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-i",
+                str(video_path),
+                "-vf",
+                f"fps=1/{sample_rate},tblend=all_mode=difference,signalstats",
+                "-frames:v",
+                "60",
+                "-f",
+                "null",
+                "-",
+            ]
+            LOG.debug("Running ffmpeg diff pipeline: %s", format_cmd_for_logging(ffmpeg_diff_cmd))
+            res = run_cmd(ffmpeg_diff_cmd)
+            stderr_lines = res.stderr.splitlines()
+
+            # Parse any Y* metrics emitted by signalstats on the diff frames (YAVG, YMAX, YDIF etc.)
+            y_any_re = re.compile(r"\bY[A-Z0-9_]*\s*[:=]\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
+            for line in stderr_lines:
+                m = y_any_re.search(line)
+                if m:
+                    try:
+                        val = float(m.group(1))
+                        motion_values.append(val)
+                        frame_count += 1
+                        LOG.debug("(ffmpeg-diff) Frame %d: Y-val=%.2f", frame_count, val)
+                    except ValueError:
+                        continue
+
+        if not motion_values:
+            sample = "\n".join(stderr_lines[-60:]) if stderr_lines else "(no stderr)"
+            LOG.warning("No motion metrics extracted from ffmpeg signalstats or fallback, using default multiplier")
+            LOG.debug("stderr sample:\n%s", sample)
             return 1.0
-        # normalize by 255 (YAVG on 0-255 scale)
-        norm_vals = [v / 255.0 for v in vals]
-        # use median-ish summary (robust to spikes)
-        try:
-            import statistics
 
-            m = statistics.median(norm_vals)
-        except Exception:
-            # fallback to simple average
-            m = sum(norm_vals) / len(norm_vals)
+        # Calculate motion statistics
+        avg_motion = sum(motion_values) / len(motion_values)
+        peak_motion = max(motion_values)
 
-        # map median to multiplier: thresholds tuned heuristically
-        if m < 0.02:
-            mult = 1.0
-        elif m < 0.06:
-            mult = 1.3
+        LOG.info(f"Motion stats - Avg: {avg_motion:.2f}, Peak: {peak_motion:.2f}")
+
+        multiplier, motion_level = _calculate_multiplier(avg_motion, peak_motion)
+
+        LOG.info(
+            f"Motion analysis complete: {motion_level.upper()} motion "
+            f"(avg={avg_motion:.2f}, peak={peak_motion:.2f}) -> multiplier={multiplier:.2f}x"
+        )
+
+        return multiplier
+    except Exception as e:
+        LOG.warning(f"Unable to complete motion analysis: {e}")
+        raise
+
+
+def _calculate_multiplier(avg_motion: float, peak_motion: float) -> tuple[float, str]:
+    """
+    Calculate bitrate multiplier based on motion metrics.
+
+    Args:
+        avg_motion: Average frame-to-frame difference (0-255)
+        peak_motion: Peak frame-to-frame difference (0-255)
+
+    Returns:
+        tuple of (multiplier: float, motion_level: str)
+    """
+
+    # Use weighted combination of average and peak motion
+    # Peak motion weighted slightly higher to catch bursts
+    motion_score = (avg_motion * 0.6) + (peak_motion * 0.4)
+
+    # Thresholds (empirically calibrated for sports footage)
+    # Low: slow-moving or static content (talking heads, slideshows)
+    # Medium: moderate motion (typical sports, conversations with movement)
+    # High: fast motion (basketball, soccer, action scenes)
+
+    LOW_THRESHOLD = 8.0
+    MEDIUM_THRESHOLD = 20.0
+
+    # Linear interpolation for smooth scaling 1.0 to 1.6
+    MIN_MULTIPLIER = 1.0
+    MAX_MULTIPLIER = 1.6
+
+    if motion_score < LOW_THRESHOLD:
+        motion_level = "low"
+        multiplier = MIN_MULTIPLIER
+    elif motion_score < MEDIUM_THRESHOLD:
+        motion_level = "medium"
+        # Linear interpolation between low and medium
+        progress = (motion_score - LOW_THRESHOLD) / (MEDIUM_THRESHOLD - LOW_THRESHOLD)
+        multiplier = MIN_MULTIPLIER + (1.3 - MIN_MULTIPLIER) * progress
+    else:
+        motion_level = "high"
+        # Linear interpolation for high motion
+        if motion_score > MEDIUM_THRESHOLD * 1.5:
+            multiplier = MAX_MULTIPLIER
         else:
-            mult = 1.6
-        LOG.debug("Motion analysis: median_norm=%.4f -> multiplier=%.2f", m, mult)
-        return mult
-    except Exception:
-        LOG.debug("Motion analysis failed; defaulting multiplier to 1.0")
-        return 1.0
+            progress = (motion_score - MEDIUM_THRESHOLD) / (MEDIUM_THRESHOLD * 0.5)
+            multiplier = 1.3 + (MAX_MULTIPLIER - 1.3) * progress
+
+    # Clamp to valid range
+    multiplier = max(MIN_MULTIPLIER, min(MAX_MULTIPLIER, multiplier))
+
+    return multiplier, motion_level
 
 
 def compute_bitrate_and_duration(path):
@@ -401,13 +519,13 @@ def format_bytes(num_bytes):
         num = float(num_bytes)
     except Exception:
         return "0 B"
-    # units
-    units = ["B", "KB", "MB", "GB", "TB"]
+    # Use IEC binary units to match 1024-based math but make units explicit
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
     idx = 0
     while num >= 1024.0 and idx < len(units) - 1:
         num /= 1024.0
         idx += 1
-    # use one decimal place for KB and above, bytes as integer
+    # bytes as integer, higher units with two decimals
     if idx == 0:
         return f"{int(num)} {units[idx]}"
     else:
@@ -429,7 +547,9 @@ def log_created_single(name, orig_size, new_size):
     """Log creation of a single-file output using format_bytes."""
     try:
         if orig_size and new_size is not None:
-            LOG.info(f"Created {name} ({format_bytes(orig_size)} -> {format_bytes(new_size)})")
+            LOG.info(
+                f"Created {name} ({format_bytes(orig_size)} -> {format_bytes(new_size)})"
+            )
         elif new_size is not None:
             LOG.info(f"Created {name} ({format_bytes(new_size)})")
         else:
@@ -442,11 +562,14 @@ def log_created_segment(name, new_size, orig_size, total_new_size):
     """Log creation of a segment and an optional running total for chunked outputs."""
     try:
         if orig_size:
-            LOG.info(f"Created {name} ({format_bytes(new_size)}) ({format_bytes(orig_size)} -> {format_bytes(total_new_size)})")
+            LOG.info(
+                f"Created {name} ({format_bytes(new_size)}) ({format_bytes(orig_size)} -> {format_bytes(total_new_size)})"
+            )
         else:
             LOG.info(f"Created {name} ({format_bytes(new_size)})")
     except Exception:
         LOG.info(f"Created {name}")
+
 
 def log_total_segments(orig_size, out, total_new_size, created_count):
     """Log total segments created for chunked outputs."""
@@ -456,7 +579,9 @@ def log_total_segments(orig_size, out, total_new_size, created_count):
                 f"Created {created_count} segment(s) for {out.name} ({format_bytes(orig_size)} -> {format_bytes(total_new_size)})"
             )
         else:
-            LOG.info(f"Created {created_count} segment(s) for {out.name} (total {format_bytes(total_new_size)})")
+            LOG.info(
+                f"Created {created_count} segment(s) for {out.name} (total {format_bytes(total_new_size)})"
+            )
     except Exception:
         LOG.info(f"Created {created_count} segment(s) for {out.name}")
 
@@ -612,8 +737,10 @@ def run_ffmpeg_with_progress(cmd, args, total_duration=None):
                         final_out_time = parse_out_time(val.strip())
                         # compute current speed and update a single-line status (throttled)
                         if time.time() - last_status_write > 0.5:
-                            pct, eta_txt, current_speed, pct_val = _compute_progress_fields(
-                            final_out_time, start, total_duration
+                            pct, eta_txt, current_speed, pct_val = (
+                                _compute_progress_fields(
+                                    final_out_time, start, total_duration
+                                )
                             )
                             try:
                                 if pct_val is None or pct_val >= last_pct_printed:
@@ -768,26 +895,17 @@ def process_file(path, args):
     # motion multiplier: sample the file to detect high motion (sports)
     try:
         # Decide whether to run motion analysis.
-        run_motion = False
-        # Always consider motion when scaling is requested (we already adapt bitrate for scaling)
-        if args.max_width is not None or args.max_height is not None:
-            run_motion = True
-        else:
-            if not getattr(args, "skip_motion_analysis", False) and (
-                duration >= int(getattr(args, "motion_threshold_seconds", 120))
-            ):
-                run_motion = True
-
-        if (
-            args.mode == "hardware"
-            and getattr(args, "quality", None) is not None
-        ):
-            LOG.debug(
+        if args.mode == "hardware" and getattr(args, "quality", None) is not None:
+            LOG.info(
                 "Hardware mode with explicit quality provided; skipping motion-based bitrate adjustment"
             )
             motion_mult = 1.0
-        elif run_motion:
-            motion_mult = compute_motion_multiplier(inp, args)
+        elif args.motion_multiplier is not None:
+            motion_mult = float(args.motion_multiplier)
+        elif not getattr(args, "skip_motion_analysis", False) and (
+            duration >= int(getattr(args, "motion_threshold_seconds", 120))
+        ):
+            motion_mult = motion_analysis(inp, args.sample_rate)
         else:
             motion_mult = 1.0
     except Exception:
@@ -818,6 +936,13 @@ def process_file(path, args):
         target_kbps = max(int(args.min_kbps), target_kbps)
     if args.max_kbps is not None:
         target_kbps = min(int(args.max_kbps), target_kbps)
+    # Ensure we never target a bitrate higher than the original source bitrate
+    try:
+        if bitrate is not None:
+            target_kbps = min(int(bitrate / 1000.0), target_kbps)
+    except Exception:
+        # If anything goes wrong here, leave target_kbps as-is
+        pass
     LOG.info(
         "%s: duration=%.1fs source=%.0f kbps -> target=%d kbps",
         inp.name,
@@ -1078,7 +1203,9 @@ def process_file(path, args):
                 final_name = f"{inp.stem}_part{idx:03d}{out.suffix}"
                 final_path = out.parent / final_name
                 if final_path.exists() and not args.overwrite:
-                    LOG.warning(f"{final_path.name} exists, skipping... (use --overwrite to replace)")
+                    LOG.warning(
+                        f"{final_path.name} exists, skipping... (use --overwrite to replace)"
+                    )
                     continue
                 os.replace(sf, final_path)
                 created_count += 1
@@ -1172,7 +1299,7 @@ def main(argv):
             if forced not in encs:
                 LOG.error(
                     f"Requested forced encoder {forced} not available in this ffmpeg build."
-                    )
+                )
                 LOG.error(
                     f"Available encoders: {', '.join(sorted(list(encs))[:40]) or '<none>'}"
                 )
@@ -1195,7 +1322,9 @@ def main(argv):
         else:
             chosen, hwaccel = choose_best_hw_encoder(args.codec)
             if chosen:
-                LOG.info(f"Auto-selected hardware encoder {chosen} (hwaccel={hwaccel}).")
+                LOG.info(
+                    f"Auto-selected hardware encoder {chosen} (hwaccel={hwaccel})."
+                )
                 args.codec = chosen
                 setattr(args, "_hwaccel", hwaccel)
             else:
@@ -1267,7 +1396,7 @@ def main(argv):
                 except Exception as e:
                     LOG.error(f"Exception processing {f}: {e}.")
     except KeyboardInterrupt:
-        LOG.error("Keyboard interrupt received, stopping program.")
+        LOG.error("\nKeyboard interrupt received, stopping program.")
         sys.exit(130)
 
 
@@ -1396,10 +1525,10 @@ def arg_parse(argv):
         help="Pass `-threads N` to ffmpeg to limit encoder threads (helps bound CPU usage).",
     )
     p.add_argument(
-        "--sample-seconds",
+        "--sample-rate",
         type=int,
-        default=15,
-        help="Number of seconds to sample for motion analysis (default 15s).",
+        default=10,
+        help="Sample the video every N seconds for motion analysis (default 10)",
     )
     p.add_argument(
         "--skip-motion-analysis",
@@ -1416,6 +1545,12 @@ def arg_parse(argv):
         "--no-bell",
         action="store_true",
         help="Do not ring terminal bell on completion",
+    )
+    p.add_argument(
+        "--motion-multiplier",
+        type=float,
+        default=None,
+        help="Manually specify motion multiplier (overrides automatic analysis). Example: 1.2",
     )
 
     args = p.parse_args(argv)
@@ -1450,8 +1585,16 @@ def arg_parse(argv):
         except Exception:
             p.error("Invalid --max-height value")
 
-    if args.sample_seconds <= 0:
-        p.error("--sample-seconds must be a positive integer")
+    if args.sample_rate <= 0:
+        p.error("--sample-rate must be a positive integer")
+
+    if args.motion_multiplier is not None:
+        try:
+            mm = float(args.motion_multiplier)
+            if mm <= 0:
+                p.error("--motion-multiplier must be > 0")
+        except Exception:
+            p.error("--motion-multiplier must be a number")
 
     if args.motion_threshold_seconds is not None and args.motion_threshold_seconds < 0:
         p.error("--motion-threshold-seconds must be >= 0")
