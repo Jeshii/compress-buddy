@@ -26,7 +26,8 @@ Options:
     --force-encoder ENCODER        Force exact ffmpeg encoder token to use (e.g. hevc_videotoolbox, h264_nvenc)
     --target-factor FACTOR         Target size factor relative to source bitrate (0.0 < FACTOR <= 1.0, default 0.7)
     --motion-multiplier MULT       Motion multiplier to adjust bitrate (default 1.0)
-    --motion-threshold-seconds N   Only run motion analysis if video is at least N seconds long (default 0)
+    --join                         Join multiple input files into a single output
+    --quick-join                   Use quick concat method (no re-encoding, may fail on incompatible inputs)
 
 
 Notes:
@@ -243,6 +244,62 @@ def nvenc_runtime_available():
         return False
 
 
+def get_software_vcodec_name(codec_hint: str) -> str:
+    """Return the software encoder token for a codec hint (h264/h265/hevc).
+
+    Examples: 'h264' -> 'libx264', 'h265'|'hevc' -> 'libx265'
+    """
+    if not codec_hint:
+        return "libx264"
+    hint = str(codec_hint).lower()
+    if "265" in hint or "hevc" in hint:
+        return "libx265"
+    return "libx264"
+
+
+def select_encoder_settings(args, mode: str, target_kbps: int | None = None):
+    """Centralize encoder selection decisions.
+
+    Returns tuple: (vcodec: str | None, crf: int | None, bitrate_kbps: int | None, quality: int | None)
+
+    - For CRF mode: returns a software `libx264`/`libx265` token and mapped CRF.
+    - For hardware mode: returns `args.codec` as the encoder token and a bitrate target
+      (unless `args.quality` is provided, in which case `quality` is returned for hw encoders).
+
+    Raises RuntimeError on unrecoverable selection failures (missing encoders).
+    """
+    mode = (mode or "").lower()
+    if mode == "crf":
+        # prefer the requested software encoder but fall back to libx264 if missing
+        req_enc = f"lib{str(getattr(args, 'codec', '')).replace('h', 'x')}"
+        available_encs = get_ffmpeg_encoders()
+        if req_enc not in available_encs:
+            LOG.warning(
+                f"{req_enc} requested but not present in ffmpeg build, falling back to libx264...",
+            )
+            req_enc = "libx264"
+            if req_enc not in available_encs:
+                raise RuntimeError(
+                    f"Neither libx265 nor libx264 available in ffmpeg encoders: {', '.join(sorted(list(available_encs))[:40]) or '<none>'}"
+                )
+        crf_val = map_quality_to_crf(getattr(args, "quality", None) or 45)
+        return req_enc, crf_val, None, None
+
+    # hardware or bitrate-driven mode
+    enc = getattr(args, "codec", None)
+    if not enc:
+        # default to codec hint
+        enc = "h264"
+    # If the caller wants a quality hint for hw encoders, we return it separately
+    hw_quality = getattr(args, "quality", None)
+    if hw_quality is not None:
+        # hardware encoders generally accept -q:v
+        return enc, None, None, hw_quality
+
+    # otherwise target a bitrate
+    return enc, None, int(target_kbps) if target_kbps is not None else None, None
+
+
 def run_cmd(cmd):
     LOG.info(f"Running command: {format_cmd_for_logging(cmd)}")
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -264,202 +321,6 @@ def ffprobe_json(path):
     if res.returncode != 0:
         raise RuntimeError(f"ffprobe failed: {res.stderr.strip()}")
     return json.loads(res.stdout)
-
-
-def motion_analysis(
-    video_path: Path,
-    sample_rate: int = 10,
-) -> dict:
-    """
-    Analyze video motion using ffmpeg's signalstats filter to measure frame differences.
-
-    Args:
-        video_path: Path to input video file
-        sample_rate: Analyze every Nth frame (10 = analyze ~10% of frames for speed)
-
-    Returns:
-        dict with keys:
-            - 'multiplier': float between 1.0 and 1.6 (bitrate scaling factor)
-            - 'motion_level': str ('low', 'medium', 'high')
-            - 'avg_motion': float (average frame-to-frame difference 0-255)
-            - 'peak_motion': float (maximum frame-to-frame difference)
-            - 'frame_count': int (total frames analyzed)
-    """
-
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video file not found: {video_path}")
-
-    LOG.info(f"Analyzing motion in: {video_path}")
-    LOG.info(f"Sample rate: every {sample_rate}th frame")
-
-    import re
-
-    slash_comma = r"""\,"""
-    filters_to_try = [f"select='not(mod(n{slash_comma}{sample_rate}))',signalstats", f"fps=1/{sample_rate},signalstats"]
-    ydif_re = re.compile(r"YDIF\s*[:=]\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
-
-    motion_values = []
-    frame_count = 0
-    stderr_lines = []
-
-    try:
-        # Try signalstats with a couple of sampling filter variants
-        for vf in filters_to_try:
-            ffmpeg_cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-i",
-                str(video_path),
-                "-vf",
-                vf,
-                "-frames:v",
-                "60",
-                "-f",
-                "null",
-                "-",
-            ]
-            LOG.debug("Running ffmpeg for motion sampling with filter: %s", vf)
-            result = run_cmd(ffmpeg_cmd)
-            stderr_lines = result.stderr.splitlines()
-
-            for line in stderr_lines:
-                m = ydif_re.search(line)
-                if m:
-                    try:
-                        ydif = float(m.group(1))
-                        motion_values.append(ydif)
-                        frame_count += 1
-                        LOG.debug("Frame %d: YDIF=%.2f", frame_count, ydif)
-                    except ValueError:
-                        LOG.warning("Could not parse numeric YDIF from line: %s", line)
-
-            if motion_values:
-                break
-
-        # Loose heuristic: look for any Y*DIF-like token then any number on the same line
-        if not motion_values:
-            loose_re = re.compile(r"\bY[A-Z0-9_]*DIF[A-Z0-9_]*\b", re.IGNORECASE)
-            num_re = re.compile(r"([+-]?\d+(?:\.\d+)?)")
-            for line in stderr_lines:
-                if loose_re.search(line):
-                    num_m = num_re.search(line)
-                    if num_m:
-                        try:
-                            ydif = float(num_m.group(1))
-                            motion_values.append(ydif)
-                            frame_count += 1
-                            LOG.debug("(loose) Frame %d: YDIF=%.2f", frame_count, ydif)
-                        except ValueError:
-                            continue
-
-        # Fallback: try an ffmpeg-only pipeline that computes per-sample-frame differences
-        # using tblend=all_mode=difference then signalstats on the resulting diff frames.
-        if not motion_values:
-            LOG.info("signalstats produced no YDIF tokens; attempting ffmpeg-only tblend+signalstats fallback")
-            ffmpeg_diff_cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-i",
-                str(video_path),
-                "-vf",
-                f"fps=1/{sample_rate},tblend=all_mode=difference,signalstats",
-                "-frames:v",
-                "60",
-                "-f",
-                "null",
-                "-",
-            ]
-            LOG.debug("Running ffmpeg diff pipeline: %s", format_cmd_for_logging(ffmpeg_diff_cmd))
-            res = run_cmd(ffmpeg_diff_cmd)
-            stderr_lines = res.stderr.splitlines()
-
-            # Parse any Y* metrics emitted by signalstats on the diff frames (YAVG, YMAX, YDIF etc.)
-            y_any_re = re.compile(r"\bY[A-Z0-9_]*\s*[:=]\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
-            for line in stderr_lines:
-                m = y_any_re.search(line)
-                if m:
-                    try:
-                        val = float(m.group(1))
-                        motion_values.append(val)
-                        frame_count += 1
-                        LOG.debug("(ffmpeg-diff) Frame %d: Y-val=%.2f", frame_count, val)
-                    except ValueError:
-                        continue
-
-        if not motion_values:
-            sample = "\n".join(stderr_lines[-60:]) if stderr_lines else "(no stderr)"
-            LOG.warning("No motion metrics extracted from ffmpeg signalstats or fallback, using default multiplier")
-            LOG.debug("stderr sample:\n%s", sample)
-            return 1.0
-
-        # Calculate motion statistics
-        avg_motion = sum(motion_values) / len(motion_values)
-        peak_motion = max(motion_values)
-
-        LOG.info(f"Motion stats - Avg: {avg_motion:.2f}, Peak: {peak_motion:.2f}")
-
-        multiplier, motion_level = _calculate_multiplier(avg_motion, peak_motion)
-
-        LOG.info(
-            f"Motion analysis complete: {motion_level.upper()} motion "
-            f"(avg={avg_motion:.2f}, peak={peak_motion:.2f}) -> multiplier={multiplier:.2f}x"
-        )
-
-        return multiplier
-    except Exception as e:
-        LOG.warning(f"Unable to complete motion analysis: {e}")
-        raise
-
-
-def _calculate_multiplier(avg_motion: float, peak_motion: float) -> tuple[float, str]:
-    """
-    Calculate bitrate multiplier based on motion metrics.
-
-    Args:
-        avg_motion: Average frame-to-frame difference (0-255)
-        peak_motion: Peak frame-to-frame difference (0-255)
-
-    Returns:
-        tuple of (multiplier: float, motion_level: str)
-    """
-
-    # Use weighted combination of average and peak motion
-    # Peak motion weighted slightly higher to catch bursts
-    motion_score = (avg_motion * 0.6) + (peak_motion * 0.4)
-
-    # Thresholds (empirically calibrated for sports footage)
-    # Low: slow-moving or static content (talking heads, slideshows)
-    # Medium: moderate motion (typical sports, conversations with movement)
-    # High: fast motion (basketball, soccer, action scenes)
-
-    LOW_THRESHOLD = 8.0
-    MEDIUM_THRESHOLD = 20.0
-
-    # Linear interpolation for smooth scaling 1.0 to 1.6
-    MIN_MULTIPLIER = 1.0
-    MAX_MULTIPLIER = 1.6
-
-    if motion_score < LOW_THRESHOLD:
-        motion_level = "low"
-        multiplier = MIN_MULTIPLIER
-    elif motion_score < MEDIUM_THRESHOLD:
-        motion_level = "medium"
-        # Linear interpolation between low and medium
-        progress = (motion_score - LOW_THRESHOLD) / (MEDIUM_THRESHOLD - LOW_THRESHOLD)
-        multiplier = MIN_MULTIPLIER + (1.3 - MIN_MULTIPLIER) * progress
-    else:
-        motion_level = "high"
-        # Linear interpolation for high motion
-        if motion_score > MEDIUM_THRESHOLD * 1.5:
-            multiplier = MAX_MULTIPLIER
-        else:
-            progress = (motion_score - MEDIUM_THRESHOLD) / (MEDIUM_THRESHOLD * 0.5)
-            multiplier = 1.3 + (MAX_MULTIPLIER - 1.3) * progress
-
-    # Clamp to valid range
-    multiplier = max(MIN_MULTIPLIER, min(MAX_MULTIPLIER, multiplier))
-
-    return multiplier, motion_level
 
 
 def compute_bitrate_and_duration(path):
@@ -518,15 +379,13 @@ def build_reencode_cmd_for_concat(concat_path: str, out_path: Path, args) -> lis
         concat_path,
     ]
 
-    # Video codec selection: prefer software x264/x265 for fallback
-    codec_hint = str(getattr(args, "codec", "") or "").lower()
-    if "265" in codec_hint or "hevc" in codec_hint:
-        vcodec = "libx265"
-    else:
-        vcodec = "libx264"
-
-    # Use CRF if quality provided (or default), otherwise fall back to a reasonable CRF
-    crf_val = map_quality_to_crf(getattr(args, "quality", None) or 45)
+    # Use centralized encoder selection for CRF (software) mode
+    try:
+        vcodec, crf_val, _, _ = select_encoder_settings(args, mode="crf")
+    except RuntimeError as e:
+        LOG.error(str(e))
+        LOG.error("no suitable software encoder found. Aborting.")
+        return []
 
     # Reuse the shared tail builder so container flags, audio handling,
     # scaling, threads and progress behavior remain consistent.
@@ -544,7 +403,20 @@ def build_reencode_cmd_for_concat(concat_path: str, out_path: Path, args) -> lis
     return cmd
 
 
-def build_encode_tail(args, has_video: bool, has_audio: bool, *, vcodec=None, crf=None, bitrate_kbps=None, tmp_path=None, chunking=False, tmp_pattern=None, out_path=None, preset=None):
+def build_encode_tail(
+    args,
+    has_video: bool,
+    has_audio: bool,
+    *,
+    vcodec=None,
+    crf=None,
+    bitrate_kbps=None,
+    tmp_path=None,
+    chunking=False,
+    tmp_pattern=None,
+    out_path=None,
+    preset=None,
+):
     """Build the tail (options + output) for an ffmpeg encode command.
 
     This is the shared logic used by `process_file()` and the concat re-encode
@@ -560,13 +432,13 @@ def build_encode_tail(args, has_video: bool, has_audio: bool, *, vcodec=None, cr
     tail += ["-map", "0:a?"]
     tail += ["-map", "0:s?"]
 
-    # Video encoding selection
+    # Video encoding selection - rely on caller-provided tokens/values
     if has_video:
         if crf is not None and vcodec is not None:
             preset_val = preset or "veryslow"
             tail += ["-c:v", vcodec, "-preset", preset_val, "-crf", str(crf)]
-        elif bitrate_kbps is not None:
-            tail += ["-c:v", "libx264", "-b:v", f"{int(bitrate_kbps)}k"]
+        elif bitrate_kbps is not None and vcodec is not None:
+            tail += ["-c:v", vcodec, "-b:v", f"{int(bitrate_kbps)}k"]
         elif vcodec is not None:
             tail += ["-c:v", vcodec]
 
@@ -578,7 +450,10 @@ def build_encode_tail(args, has_video: bool, has_audio: bool, *, vcodec=None, cr
             pass
 
     # Scaling filter
-    if getattr(args, "max_width", None) is not None or getattr(args, "max_height", None) is not None:
+    if (
+        getattr(args, "max_width", None) is not None
+        or getattr(args, "max_height", None) is not None
+    ):
         mw = args.max_width or "iw"
         mh = args.max_height or "ih"
         vf = f"scale='min({mw},iw)':'min({mh},ih)':force_original_aspect_ratio=decrease"
@@ -885,6 +760,84 @@ def run_ffmpeg_with_progress(cmd, total_duration=None):
     )
 
 
+def encode_and_handle_output(
+    cmd,
+    out,
+    inputs,
+    args,
+    tmp_path=None,
+    tmp_dir=None,
+    tmp_pattern=None,
+    chunking=False,
+    total_duration=None,
+    orig_size=None,
+):
+    """Run ffmpeg via `run_ffmpeg_with_progress`, then move segments or atomically replace output.
+
+    Returns (success: bool, final_speed, elapsed_sec, final_out_time).
+    """
+    LOG.info("Running ffmpeg command: %s", format_cmd_for_logging(cmd))
+
+    rc, _, stderr_text, speed, elapsed_sec, final_out_time = run_ffmpeg_with_progress(
+        cmd, total_duration=total_duration
+    )
+    if rc != 0:
+        err = stderr_text.strip().splitlines()
+        tail = err[-10:] if err else ["<no stderr>"]
+        tail_text = "\n".join(tail)
+        LOG.error(
+            f"ffmpeg failed for {out.name if out is not None else 'output'}: {tail_text}"
+        )
+        # attempt cleanup of tmp artifacts
+        try:
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            if tmp_dir and tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        LOG.debug(f"Full ffmpeg stderr:\n{stderr_text}")
+        LOG.debug(f"Full ffmpeg cmd: {' '.join(shlex.quote(x) for x in cmd)}")
+        return False, speed, elapsed_sec, final_out_time
+
+    # handle outputs (segments or single file)
+    if chunking:
+        seg_files = sorted(Path(tmp_dir).glob(Path(inputs[0]).stem + ".*" + out.suffix))
+        if not seg_files:
+            LOG.error("No segments produced by ffmpeg.")
+            return False, speed, elapsed_sec, final_out_time
+        total_new_size = 0
+        created_count = 0
+        for idx, sf in enumerate(seg_files, start=1):
+            target_name = out.parent / f"{out.stem}_part{idx:03d}{out.suffix}"
+            if target_name.exists() and not args.overwrite:
+                LOG.warning(
+                    f"{target_name.name} exists, skipping... (use --overwrite to replace)"
+                )
+                continue
+            os.replace(sf, target_name)
+            new_sz = target_name.stat().st_size if target_name.exists() else None
+            total_new_size += new_sz or 0
+            created_count += 1
+            log_created_segment(target_name.name, new_sz, orig_size, total_new_size)
+        if created_count:
+            log_total_segments(orig_size, out, total_new_size, created_count)
+    else:
+        try:
+            if out.exists() and not args.overwrite:
+                LOG.error(
+                    f"{out.name} exists and --overwrite not set. Skipping moving output."
+                )
+            else:
+                os.replace(tmp_path, out)
+            new_sz = out.stat().st_size if out.exists() else None
+            log_created_single(out.name, orig_size, new_sz)
+        except Exception:
+            LOG.error("Failed to move output into final location.")
+
+    return True, speed, elapsed_sec, final_out_time
+
+
 def process_concat_list(concat_path: str, inputs: list, args):
     """Encode directly from a concat list (single ffmpeg invocation).
 
@@ -912,7 +865,12 @@ def process_concat_list(concat_path: str, inputs: list, args):
             tmp_dir = Path(tempfile.mkdtemp(prefix=out.name + ".", dir=str(out.parent)))
             tmp_pattern = str(tmp_dir / (Path(inputs[0]).stem + ".%03d" + out.suffix))
         else:
-            with tempfile.NamedTemporaryFile(prefix=out.stem + ".", suffix=out.suffix, dir=str(out.parent), delete=False) as tf:
+            with tempfile.NamedTemporaryFile(
+                prefix=out.stem + ".",
+                suffix=out.suffix,
+                dir=str(out.parent),
+                delete=False,
+            ) as tf:
                 tmp_path = Path(tf.name)
 
         # build initial concat input command
@@ -930,19 +888,18 @@ def process_concat_list(concat_path: str, inputs: list, args):
             concat_path,
         ]
 
-        # choose codec options
+        # choose codec options using centralized selection
         vcodec = None
         crf_val = None
         bitrate_kbps = None
-        if args.mode == "crf":
-            # pick software encoder token
-            if args.codec == "h265" or str(args.codec).lower() == "hevc":
-                vcodec = "libx265"
-            else:
-                vcodec = "libx264"
-            crf_val = map_quality_to_crf(getattr(args, "quality", None) or 45)
-        else:
-            bitrate_kbps = None
+        try:
+            vcodec, crf_val, bitrate_kbps, _ = select_encoder_settings(
+                args, mode=args.mode, target_kbps=None
+            )
+        except RuntimeError as e:
+            LOG.error(str(e))
+            LOG.error("no suitable encoder found for concat-encode. Aborting.")
+            return
 
         tail = build_encode_tail(
             args,
@@ -964,48 +921,21 @@ def process_concat_list(concat_path: str, inputs: list, args):
             LOG.info("(dry-run) Would run: %s", format_cmd_for_logging(cmd))
             # In dry-run mode we don't produce files; return early
             return
-        res = run_cmd(cmd)
-        if res.returncode != 0:
-            LOG.error(f"ffmpeg failed for joined input: {res.stderr}")
-            try:
-                if tmp_path and tmp_path.exists():
-                    tmp_path.unlink(missing_ok=True)
-                if tmp_dir and tmp_dir.exists():
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-            except Exception:
-                pass
-            sys.exit(1)
 
-        # handle outputs (segments or single file)
-        if chunking:
-            seg_files = sorted(Path(tmp_dir).glob(Path(inputs[0]).stem + ".*" + out.suffix))
-            if not seg_files:
-                LOG.error("No segments produced by ffmpeg concat-encode.")
-                return
-            total_new_size = 0
-            created_count = 0
-            for idx, sf in enumerate(seg_files, start=1):
-                target_name = out.parent / f"{out.stem}_part{idx:03d}{out.suffix}"
-                if target_name.exists() and not args.overwrite:
-                    LOG.warning(f"{target_name.name} exists, skipping... (use --overwrite to replace)")
-                    continue
-                os.replace(sf, target_name)
-                new_sz = target_name.stat().st_size if target_name.exists() else None
-                total_new_size += new_sz or 0
-                created_count += 1
-                log_created_segment(target_name.name, new_sz, None, total_new_size)
-            if created_count:
-                log_total_segments(None, out, total_new_size, created_count)
-        else:
-            try:
-                if out.exists() and not args.overwrite:
-                    LOG.error(f"{out.name} exists and --overwrite not set. Skipping moving joined output.")
-                else:
-                    os.replace(tmp_path, out)
-                new_sz = out.stat().st_size if out.exists() else None
-                log_created_single(out.name, None, new_sz)
-            except Exception:
-                LOG.error("Failed to move joined output into final location.")
+        success, speed, elapsed_sec, final_out_time = encode_and_handle_output(
+            cmd,
+            out,
+            inputs,
+            args,
+            tmp_path=tmp_path,
+            tmp_dir=tmp_dir,
+            tmp_pattern=tmp_pattern,
+            chunking=chunking,
+            total_duration=None,
+            orig_size=None,
+        )
+        if not success:
+            sys.exit(1)
 
         return
     finally:
@@ -1144,9 +1074,7 @@ def process_file(path, args):
     except Exception:
         scale_multiplier = 1.0
 
-    # motion multiplier: sample the file to detect high motion (sports)
     try:
-        # Decide whether to run motion analysis.
         if args.mode == "hardware" and getattr(args, "quality", None) is not None:
             LOG.info(
                 "Hardware mode with explicit quality provided; skipping motion-based bitrate adjustment"
@@ -1154,10 +1082,6 @@ def process_file(path, args):
             motion_mult = 1.0
         elif args.motion_multiplier is not None:
             motion_mult = float(args.motion_multiplier)
-        elif not getattr(args, "skip_motion_analysis", False) and (
-            duration >= int(getattr(args, "motion_threshold_seconds", 120))
-        ):
-            motion_mult = motion_analysis(inp, args.sample_rate)
         else:
             motion_mult = 1.0
     except Exception:
@@ -1209,7 +1133,6 @@ def process_file(path, args):
     has_audio = any(s.get("codec_type") == "audio" for s in streams)
     has_subs = any(s.get("codec_type") == "subtitle" for s in streams)
 
-
     # Check whether the input video codec has any hardware decoder available
     if has_video:
         # determine codec_name for video
@@ -1258,6 +1181,7 @@ def process_file(path, args):
     chunking = int(chunk_minutes) > 0
     tmp_dir = None
     tmp_path = None
+    tmp_pattern = None
     if chunking:
         # create a temporary directory next to the output so moves are atomic
         tmp_dir = Path(tempfile.mkdtemp(prefix=out.name + ".", dir=str(out.parent)))
@@ -1288,47 +1212,47 @@ def process_file(path, args):
         tail_crf = None
         tail_bitrate = None
 
-        if args.mode == "crf":
-            req_enc = f"lib{args.codec.replace('h', 'x')}"
-            available_encs = get_ffmpeg_encoders()
-            if req_enc not in available_encs:
-                LOG.warning(
-                    f"{req_enc} requested but not present in ffmpeg build, falling back to libx264...",
-                )
-                req_enc = "libx264"
-                if req_enc not in available_encs:
-                    LOG.error(
-                        f"Neither libx265 nor libx264 available in ffmpeg encoders: {', '.join(sorted(list(available_encs))[:40]) or '<none>'}",
-                    )
-                    LOG.error(
-                        "no suitable software encoder found. Install x264/x265 or run in hardware mode. Aborting.",
-                    )
-                    try:
-                        if tmp_path and tmp_path.exists():
-                            tmp_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    return
-            crf_val = map_quality_to_crf(args.quality)
-            LOG.info("Using CRF=%s (mapped from quality=%s)", crf_val, args.quality)
+        # Centralized encoder selection
+        try:
+            sel_vcodec, sel_crf, sel_bitrate, sel_quality = select_encoder_settings(
+                args, mode=args.mode, target_kbps=target_kbps
+            )
+        except RuntimeError as e:
+            LOG.error(str(e))
+            try:
+                if tmp_path and tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
 
+        if args.mode == "crf":
+            # software encoder token and CRF mapped
+            cmd += ["-c:v", sel_vcodec]
+            cmd += ["-crf", str(sel_crf)]
+            LOG.info("Using CRF=%s (mapped from quality=%s)", sel_crf, args.quality)
         else:
-            # hardware or bitrate-based mode: keep encoder tokens as before
-            enc = args.codec
-            if any(k in enc for k in ("nvenc", "qsv", "videotoolbox", "d3d11va", "dxva2")):
-                cmd += ["-c:v", enc]
+            # hardware or bitrate-based mode
+            enc = sel_vcodec
+            if enc is None:
+                enc = args.codec
+            if any(
+                k in str(enc)
+                for k in ("nvenc", "qsv", "videotoolbox", "d3d11va", "dxva2")
+            ):
+                cmd += ["-c:v", str(enc)]
             else:
                 cmd += ["-c:v", f"{enc}_videotoolbox"]
-            if args.quality:
-                cmd += ["-q:v", str(args.quality)]
-            else:
+            if sel_quality is not None:
+                cmd += ["-q:v", str(sel_quality)]
+            elif sel_bitrate is not None:
                 cmd += [
                     "-b:v",
-                    f"{target_kbps}k",
+                    f"{sel_bitrate}k",
                     "-maxrate",
-                    f"{target_kbps}k",
+                    f"{sel_bitrate}k",
                     "-bufsize",
-                    f"{max(1000, target_kbps*2)}k",
+                    f"{max(1000, sel_bitrate*2)}k",
                 ]
 
         # Build shared tail and append
@@ -1347,64 +1271,20 @@ def process_file(path, args):
 
         cmd += tail
 
-        ffmpeg_command_message = "Running ffmpeg command: "
-        cmd_str = format_cmd_for_logging(cmd)
-        ffmpeg_command_message += f"{cmd_str}"
-        LOG.info(ffmpeg_command_message)
-
-        rc, _, stderr_text, speed, elapsed_sec, final_out_time = (
-            run_ffmpeg_with_progress(cmd, total_duration=duration)
+        success, speed, elapsed_sec, final_out_time = encode_and_handle_output(
+            cmd,
+            out,
+            [str(inp)],
+            args,
+            tmp_path=tmp_path,
+            tmp_dir=tmp_dir,
+            tmp_pattern=tmp_pattern,
+            chunking=chunking,
+            total_duration=duration,
+            orig_size=orig_size,
         )
-        if rc != 0:
-            err = stderr_text.strip().splitlines()
-            tail = err[-10:] if err else ["<no stderr>"]
-            tail_text = "\n".join(tail)
-            LOG.error(f"ffmpeg failed for {inp.name}: {tail_text}")
-            try:
-                if tmp_path and tmp_path.exists():
-                    tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            LOG.debug(f"Full ffmpeg stderr:\n{stderr_text}")
-            LOG.debug(f"Full ffmpeg cmd: {' '.join(shlex.quote(x) for x in cmd)}")
+        if not success:
             return
-
-        if chunking:
-            # move all generated segments from tmp_dir to final names in out.parent
-            seg_files = sorted(tmp_dir.glob(inp.stem + ".*" + out.suffix))
-            if not seg_files:
-                LOG.error(f"No segments produced for {inp.name}. Aborting.")
-            total_new_size = 0
-            created_count = 0
-            for idx, sf in enumerate(seg_files, start=1):
-                final_name = f"{inp.stem}_part{idx:03d}{out.suffix}"
-                final_path = out.parent / final_name
-                if final_path.exists() and not args.overwrite:
-                    LOG.warning(
-                        f"{final_path.name} exists, skipping... (use --overwrite to replace)"
-                    )
-                    continue
-                os.replace(sf, final_path)
-                created_count += 1
-                new_sz = 0
-                try:
-                    new_sz = final_path.stat().st_size
-                except Exception:
-                    pass
-                total_new_size += new_sz
-                log_created_segment(final_path.name, new_sz, orig_size, total_new_size)
-            # summary for chunked output
-            if created_count:
-                log_total_segments(orig_size, out, total_new_size, created_count)
-        else:
-            # Atomic replace
-            os.replace(tmp_path, out)
-            new_sz = None
-            try:
-                new_sz = out.stat().st_size
-            except Exception:
-                new_sz = None
-            log_created_single(out.name, orig_size, new_sz)
         LOG.info(f"Encode speed: {speed:.2f}x realtime")
         try:
             hrs = int(elapsed_sec // 3600)
@@ -1560,7 +1440,9 @@ def main(argv):
     # Handle --quick_join: concatenate all inputs into a single temp file first
     if getattr(args, "quick_join", False):
         if len(files) < 2:
-            LOG.warning("--quick-join requires at least 2 input files, processing normally...")
+            LOG.warning(
+                "--quick-join requires at least 2 input files, processing normally..."
+            )
         else:
             LOG.info(f"Quick-joining {len(files)} input files into a single video...")
             # Create a temporary concat file
@@ -1574,12 +1456,21 @@ def main(argv):
                 try:
                     first_parent = Path(files[0]).parent
                     first_parent.mkdir(parents=False, exist_ok=True)
-                    fd_path = first_parent / ("compress_buddy_concat_" + next(tempfile._get_candidate_names()) + ".txt")
+                    fd_path = first_parent / (
+                        "compress_buddy_concat_"
+                        + next(tempfile._get_candidate_names())
+                        + ".txt"
+                    )
                     # Use low-level open to mimic mkstemp behavior (descriptor + path)
-                    concat_fd = os.open(str(fd_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    concat_fd = os.open(
+                        str(fd_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                    )
                     concat_path = str(fd_path)
                 except Exception:
-                    concat_fd, concat_path = tempfile.mkstemp(suffix=".txt", prefix="compress_buddy_concat_")
+                    concat_fd, concat_path = tempfile.mkstemp(
+                        suffix=".txt", prefix="compress_buddy_concat_"
+                    )
+                LOG.info(f"Writing concat list to: {concat_path}")
                 with os.fdopen(concat_fd, "w") as cf:
                     for f in files:
                         # ffmpeg concat demuxer requires absolute paths; quote when needed
@@ -1590,7 +1481,7 @@ def main(argv):
                             cf.write(f'file "{ap}"\n')
                         else:
                             cf.write(f"file '{ap}'\n")
-                
+
                 # Determine output name for joined file
                 if getattr(args, "output", None):
                     out_dir = Path(args.output)
@@ -1600,20 +1491,20 @@ def main(argv):
                     # Use parent of first input file
                     out_dir = Path(files[0]).parent
                     joined_name = "joined" + "." + args.suffix
-                
+
                 joined_path = out_dir / joined_name
-                
+
                 # Create temp file for joined output
                 with tempfile.NamedTemporaryFile(
                     prefix=joined_path.stem + ".",
                     suffix=joined_path.suffix,
                     dir=str(out_dir),
-                    delete=False
+                    delete=False,
                 ) as tf:
                     joined_tmp = Path(tf.name)
-                
+
                 LOG.info(f"Concatenating to: {joined_path}")
-                
+
                 if not args.dry_run:
                     # Run ffmpeg concat using run_cmd() to ensure standardized logging
                     concat_cmd = [
@@ -1635,17 +1526,16 @@ def main(argv):
 
                     result = run_cmd(concat_cmd)
 
-
                     if result.returncode != 0:
                         # Copy-based concat failed, inform user and abort
-                        LOG.error(
-                            "Copy-based concat failed, aborting quick-join..."
-                        )
+                        LOG.error("Copy-based concat failed, aborting quick-join...")
                         sys.exit(1)
 
                         # Move to final location (respect --overwrite)
                     if joined_path.exists() and not args.overwrite:
-                        LOG.error(f"{joined_path.name} exists and --overwrite not set. Aborting quick-join.")
+                        LOG.error(
+                            f"{joined_path.name} exists and --overwrite not set. Aborting quick-join."
+                        )
                         try:
                             if joined_tmp and joined_tmp.exists():
                                 joined_tmp.unlink(missing_ok=True)
@@ -1659,10 +1549,12 @@ def main(argv):
                     files = [str(joined_path)]
                     quick_joined_path = Path(joined_path)
                 else:
-                    LOG.info(f"(dry-run) Would join {len(files)} files into {joined_path}")
+                    LOG.info(
+                        f"(dry-run) Would join {len(files)} files into {joined_path}"
+                    )
                     # In dry-run, just process the first file as a placeholder
                     files = files[:1]
-                
+
             except Exception as e:
                 LOG.error(f"Failed to join videos: {e}")
                 sys.exit(1)
@@ -1693,12 +1585,21 @@ def main(argv):
                     # the first input so it's easy to inspect while running.
                     first_parent = Path(files[0]).parent
                     first_parent.mkdir(parents=False, exist_ok=True)
-                    fd_path = first_parent / ("compress_buddy_concat_" + next(tempfile._get_candidate_names()) + ".txt")
-                    concat_fd = os.open(str(fd_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    fd_path = first_parent / (
+                        "compress_buddy_concat_"
+                        + next(tempfile._get_candidate_names())
+                        + ".txt"
+                    )
+                    concat_fd = os.open(
+                        str(fd_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                    )
                     concat_path = str(fd_path)
                 except Exception:
-                    concat_fd, concat_path = tempfile.mkstemp(suffix=".txt", prefix="compress_buddy_concat_")
+                    concat_fd, concat_path = tempfile.mkstemp(
+                        suffix=".txt", prefix="compress_buddy_concat_"
+                    )
                 try:
+                    LOG.info(f"Writing concat list to: {concat_path}")
                     with os.fdopen(concat_fd, "w") as cf:
                         for f in files:
                             # ffmpeg concat demuxer requires absolute paths; quote when needed
@@ -1861,23 +1762,6 @@ def arg_parse(argv):
         help="Pass `-threads N` to ffmpeg to limit encoder threads (helps bound CPU usage).",
     )
     p.add_argument(
-        "--sample-rate",
-        type=int,
-        default=10,
-        help="Sample the video every N seconds for motion analysis (default 10)",
-    )
-    p.add_argument(
-        "--skip-motion-analysis",
-        action="store_true",
-        help="Do not run motion analysis even when auto-enabled for long videos",
-    )
-    p.add_argument(
-        "--motion-threshold-seconds",
-        type=int,
-        default=120,
-        help="Auto-run motion analysis for videos with duration >= this many seconds (default 120s)",
-    )
-    p.add_argument(
         "--no-bell",
         action="store_true",
         help="Do not ring terminal bell on completion",
@@ -1886,7 +1770,7 @@ def arg_parse(argv):
         "--motion-multiplier",
         type=float,
         default=None,
-        help="Manually specify motion multiplier (overrides automatic analysis). Example: 1.2",
+        help="Specify motion multiplier. >1.0 increases bitrate for high-motion videos, <1.0 decreases for low-motion.",
     )
 
     args = p.parse_args(argv)
@@ -1921,9 +1805,6 @@ def arg_parse(argv):
         except Exception:
             p.error("Invalid --max-height value")
 
-    if args.sample_rate <= 0:
-        p.error("--sample-rate must be a positive integer")
-
     if args.motion_multiplier is not None:
         try:
             mm = float(args.motion_multiplier)
@@ -1931,9 +1812,6 @@ def arg_parse(argv):
                 p.error("--motion-multiplier must be > 0")
         except Exception:
             p.error("--motion-multiplier must be a number")
-
-    if args.motion_threshold_seconds is not None and args.motion_threshold_seconds < 0:
-        p.error("--motion-threshold-seconds must be >= 0")
 
     if args.workers <= 0:
         p.error("--workers must be a positive integer")

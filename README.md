@@ -74,46 +74,41 @@ General
 - `--log-level <DEBUG|INFO|WARNING|ERROR>` — set logging verbosity (default: INFO).
 - `--no-bell` — suppress terminal bell on completion.
 
-Encoding / codec selection
+Encoding
 - `--mode {hardware,crf,software}` — encode mode. `hardware` uses platform HW accel, `crf` uses constant-rate-factor software encoding.
 - `--quality <0-100>` — user-facing quality (0 worst, 100 best). In CRF mode we map this to ffmpeg's CRF scale.
 - `--codec {h264,h265,avc,hevc,x264,x265,size,compatibility}` — high-level codec choice (we normalize to `h264` / `h265`).
 - `--force-encoder <TOKEN>` — force an exact ffmpeg encoder token (e.g. `hevc_videotoolbox`, `h264_nvenc`). We validate the token against `ffmpeg -encoders`.
 - `--suffix {mp4,mov,mkv,avi}` — output file suffix (default: `mov`).
 
-Bitrate / quality targeting
+Quality
 - `--min-kbps <N>` — minimum target bitrate in kbps (optional). If ffprobe cannot determine source bitrate, we will ask for bounds or abort.
 - `--max-kbps <N>` — maximum target bitrate in kbps (optional).
-- `--target-factor <float>` — fraction of source bitrate to target (0.0 < factor <= 1.0). Default: `0.7`.
+- `--target-factor <float>` — fraction of source bitrate to target (0.0 < factor <= 1.0). Default: `0.7`.\
+- `--motion-multiplier <float>` — Specify motion multiplier. Less than 1.0 for low motion videos, more than 1.0 for high motion videos.
 
 Audio
 - `--copy-audio` — copy AAC audio streams instead of re-encoding.
 - If not copying and input audio is not AAC, we encode audio to AAC at 128k.
 
-Scaling / dimensions
+Scaling
 - `--max-width <px>` — maximum output width in pixels (preserves aspect ratio).
 - `--max-height <px>` — maximum output height in pixels (preserves aspect ratio).
 - If only one of `--max-width`/`--max-height` is provided, we infer the other from the input aspect ratio.
 
-Chunking / output
+Output
 - `--output, -o <DIR>` — output directory (place converted files here).
 - `--chunk-minutes <N>` — split output into N-minute segments. Segments are written to a temporary directory next to the output and then moved into place after encoding.
 - `--overwrite` — overwrite existing outputs.
 - `--delete-original` — delete original file after successful compression.
+- `--join` - join videos together during processing.
+- `--quick-join` - attempt to join videos together quickly with ffmpeg copy and then pass that on to processing.
 
-Performance / resource control
+Performance / Resource Control
 - `--workers <N>` — number of parallel workers (we force `1` for macOS hardware mode for stability).
 - `--threads <N>` — pass `-threads N` to ffmpeg to bound encoder threads.
 
-Motion analysis (optional)
-- `--sample-rate <seconds>` — sample the video every N seconds for motion analysis (default: `10`).
-- `--skip-motion-analysis` — do not run motion analysis even when auto-enabled.
-- `--motion-threshold-seconds <seconds>` — only run motion analysis for videos with duration >= this value (default: `120`).
-- `--motion-multiplier <float>` — manually specify motion multiplier to override automatic analysis (e.g. `1.2`).
-
-Other
-- `--target-factor` — see Bitrate / quality targeting above.
-- `--copy-audio` — see Audio above.
+Motion
 
 Notes
 - We clamp computed target bitrates to `--min-kbps` / `--max-kbps` if provided, and never intentionally target a bitrate higher than the source (as reported by ffprobe).
