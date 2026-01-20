@@ -56,6 +56,16 @@ Chunk output into 15-minute parts:
 python3 compress_buddy.py --chunk-minutes 15 -o /tmp/outdir long_video.mov
 ```
 
+Join multiple inputs:
+
+```bash
+# process multiple inputs as a single logical input (one encode pass)
+python3 compress_buddy.py --join -o /tmp/outdir part1.mov part2.mov
+
+# quick-join: perform a fast copy-based concat (-c copy), fail if incompatible, then process the joined result
+python3 compress_buddy.py --quick-join -o /tmp/outdir part1.mov part2.mov
+```
+
 ## Options
 
 General
@@ -94,7 +104,6 @@ Chunking / output
 Performance / resource control
 - `--workers <N>` — number of parallel workers (we force `1` for macOS hardware mode for stability).
 - `--threads <N>` — pass `-threads N` to ffmpeg to bound encoder threads.
-- `--nice <N>` — start ffmpeg with this niceness on POSIX (higher = lower priority). Suggested: `5`, `10`, `15`. On Windows, lowering priority requires the optional `psutil` package.
 
 Motion analysis (optional)
 - `--sample-rate <seconds>` — sample the video every N seconds for motion analysis (default: `10`).
@@ -179,31 +188,6 @@ python compress_buddy.py -o C:\tmp test.mp4
 - If you see errors about unknown encoders, try installing `ffmpeg-full`, install an ffmpeg build with the required encoders (e.g., `libx264`, `libx265`)
 - To get more visibility into ffmpeg progress and script decisions, run with `--log-level DEBUG` (it is very VERBOSE tho)
 
-## Running ffmpeg at lower priority (`--nice`)
-
-You can request the child ffmpeg process be started with a lower CPU priority using `--nice N`. This helps keep encodes from interfering with interactive work.
-
-- I think these are niceness values:
-	- `5` — light background priority
-	- `10` — typical background priority
-	- `15` — very low priority
-
-On macOS/Linux you can verify niceness with:
-
-```bash
-# find the ffmpeg PID (example) and show niceness
-ps -o pid,ni,cmd -C ffmpeg
-
-# or watch during run
-top -o %CPU
-```
-
-On Windows, use Task Manager or PowerShell to inspect process priority:
-
-```powershell
-# list ffmpeg processes
-Get-Process ffmpeg | Select-Object Id,ProcessName,PriorityClass
-```
 
 ## Limiting CPU usage and threads
 
