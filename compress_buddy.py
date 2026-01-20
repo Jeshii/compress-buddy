@@ -326,202 +326,6 @@ def ffprobe_json(path):
     return json.loads(res.stdout)
 
 
-def motion_analysis(
-    video_path: Path,
-    sample_rate: int = 10,
-) -> dict:
-    """
-    Analyze video motion using ffmpeg's signalstats filter to measure frame differences.
-
-    Args:
-        video_path: Path to input video file
-        sample_rate: Analyze every Nth frame (10 = analyze ~10% of frames for speed)
-
-    Returns:
-        dict with keys:
-            - 'multiplier': float between 1.0 and 1.6 (bitrate scaling factor)
-            - 'motion_level': str ('low', 'medium', 'high')
-            - 'avg_motion': float (average frame-to-frame difference 0-255)
-            - 'peak_motion': float (maximum frame-to-frame difference)
-            - 'frame_count': int (total frames analyzed)
-    """
-
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video file not found: {video_path}")
-
-    LOG.info(f"Analyzing motion in: {video_path}")
-    LOG.info(f"Sample rate: every {sample_rate}th frame")
-
-    import re
-
-    slash_comma = r"""\,"""
-    filters_to_try = [f"select='not(mod(n{slash_comma}{sample_rate}))',signalstats", f"fps=1/{sample_rate},signalstats"]
-    ydif_re = re.compile(r"YDIF\s*[:=]\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
-
-    motion_values = []
-    frame_count = 0
-    stderr_lines = []
-
-    try:
-        # Try signalstats with a couple of sampling filter variants
-        for vf in filters_to_try:
-            ffmpeg_cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-i",
-                str(video_path),
-                "-vf",
-                vf,
-                "-frames:v",
-                "60",
-                "-f",
-                "null",
-                "-",
-            ]
-            LOG.debug("Running ffmpeg for motion sampling with filter: %s", vf)
-            result = run_cmd(ffmpeg_cmd)
-            stderr_lines = result.stderr.splitlines()
-
-            for line in stderr_lines:
-                m = ydif_re.search(line)
-                if m:
-                    try:
-                        ydif = float(m.group(1))
-                        motion_values.append(ydif)
-                        frame_count += 1
-                        LOG.debug("Frame %d: YDIF=%.2f", frame_count, ydif)
-                    except ValueError:
-                        LOG.warning("Could not parse numeric YDIF from line: %s", line)
-
-            if motion_values:
-                break
-
-        # Loose heuristic: look for any Y*DIF-like token then any number on the same line
-        if not motion_values:
-            loose_re = re.compile(r"\bY[A-Z0-9_]*DIF[A-Z0-9_]*\b", re.IGNORECASE)
-            num_re = re.compile(r"([+-]?\d+(?:\.\d+)?)")
-            for line in stderr_lines:
-                if loose_re.search(line):
-                    num_m = num_re.search(line)
-                    if num_m:
-                        try:
-                            ydif = float(num_m.group(1))
-                            motion_values.append(ydif)
-                            frame_count += 1
-                            LOG.debug("(loose) Frame %d: YDIF=%.2f", frame_count, ydif)
-                        except ValueError:
-                            continue
-
-        # Fallback: try an ffmpeg-only pipeline that computes per-sample-frame differences
-        # using tblend=all_mode=difference then signalstats on the resulting diff frames.
-        if not motion_values:
-            LOG.info("signalstats produced no YDIF tokens; attempting ffmpeg-only tblend+signalstats fallback")
-            ffmpeg_diff_cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-i",
-                str(video_path),
-                "-vf",
-                f"fps=1/{sample_rate},tblend=all_mode=difference,signalstats",
-                "-frames:v",
-                "60",
-                "-f",
-                "null",
-                "-",
-            ]
-            LOG.debug("Running ffmpeg diff pipeline: %s", format_cmd_for_logging(ffmpeg_diff_cmd))
-            res = run_cmd(ffmpeg_diff_cmd)
-            stderr_lines = res.stderr.splitlines()
-
-            # Parse any Y* metrics emitted by signalstats on the diff frames (YAVG, YMAX, YDIF etc.)
-            y_any_re = re.compile(r"\bY[A-Z0-9_]*\s*[:=]\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
-            for line in stderr_lines:
-                m = y_any_re.search(line)
-                if m:
-                    try:
-                        val = float(m.group(1))
-                        motion_values.append(val)
-                        frame_count += 1
-                        LOG.debug("(ffmpeg-diff) Frame %d: Y-val=%.2f", frame_count, val)
-                    except ValueError:
-                        continue
-
-        if not motion_values:
-            sample = "\n".join(stderr_lines[-60:]) if stderr_lines else "(no stderr)"
-            LOG.warning("No motion metrics extracted from ffmpeg signalstats or fallback, using default multiplier")
-            LOG.debug("stderr sample:\n%s", sample)
-            return 1.0
-
-        # Calculate motion statistics
-        avg_motion = sum(motion_values) / len(motion_values)
-        peak_motion = max(motion_values)
-
-        LOG.info(f"Motion stats - Avg: {avg_motion:.2f}, Peak: {peak_motion:.2f}")
-
-        multiplier, motion_level = _calculate_multiplier(avg_motion, peak_motion)
-
-        LOG.info(
-            f"Motion analysis complete: {motion_level.upper()} motion "
-            f"(avg={avg_motion:.2f}, peak={peak_motion:.2f}) -> multiplier={multiplier:.2f}x"
-        )
-
-        return multiplier
-    except Exception as e:
-        LOG.warning(f"Unable to complete motion analysis: {e}")
-        raise
-
-
-def _calculate_multiplier(avg_motion: float, peak_motion: float) -> tuple[float, str]:
-    """
-    Calculate bitrate multiplier based on motion metrics.
-
-    Args:
-        avg_motion: Average frame-to-frame difference (0-255)
-        peak_motion: Peak frame-to-frame difference (0-255)
-
-    Returns:
-        tuple of (multiplier: float, motion_level: str)
-    """
-
-    # Use weighted combination of average and peak motion
-    # Peak motion weighted slightly higher to catch bursts
-    motion_score = (avg_motion * 0.6) + (peak_motion * 0.4)
-
-    # Thresholds (empirically calibrated for sports footage)
-    # Low: slow-moving or static content (talking heads, slideshows)
-    # Medium: moderate motion (typical sports, conversations with movement)
-    # High: fast motion (basketball, soccer, action scenes)
-
-    LOW_THRESHOLD = 8.0
-    MEDIUM_THRESHOLD = 20.0
-
-    # Linear interpolation for smooth scaling 1.0 to 1.6
-    MIN_MULTIPLIER = 1.0
-    MAX_MULTIPLIER = 1.6
-
-    if motion_score < LOW_THRESHOLD:
-        motion_level = "low"
-        multiplier = MIN_MULTIPLIER
-    elif motion_score < MEDIUM_THRESHOLD:
-        motion_level = "medium"
-        # Linear interpolation between low and medium
-        progress = (motion_score - LOW_THRESHOLD) / (MEDIUM_THRESHOLD - LOW_THRESHOLD)
-        multiplier = MIN_MULTIPLIER + (1.3 - MIN_MULTIPLIER) * progress
-    else:
-        motion_level = "high"
-        # Linear interpolation for high motion
-        if motion_score > MEDIUM_THRESHOLD * 1.5:
-            multiplier = MAX_MULTIPLIER
-        else:
-            progress = (motion_score - MEDIUM_THRESHOLD) / (MEDIUM_THRESHOLD * 0.5)
-            multiplier = 1.3 + (MAX_MULTIPLIER - 1.3) * progress
-
-    # Clamp to valid range
-    multiplier = max(MIN_MULTIPLIER, min(MAX_MULTIPLIER, multiplier))
-
-    return multiplier, motion_level
-
-
 def compute_bitrate_and_duration(path):
     info = ffprobe_json(path)
     duration = float(info.get("format", {}).get("duration") or 0.0)
@@ -543,6 +347,148 @@ def compute_bitrate_and_duration(path):
             try:
                 bitrate = int(fmt_br)
                 bitrate_source = "format"
+            except Exception:
+                bitrate = None
+    # If still no bitrate, return None so caller can decide (we intentionally do not estimate from size/duration).
+    return bitrate, duration, info, bitrate_source
+
+
+def build_common_base(inp, hardware_accel=None, error_level="error"):
+    base = ["ffmpeg", "-y", "-hide_banner", "-loglevel", error_level]
+    if hardware_accel:
+        base += ["-hwaccel", hardware_accel]
+    base += ["-i", str(inp)]
+    return base
+
+
+def build_reencode_cmd_for_concat(concat_path: str, out_path: Path, args) -> list:
+    """Build an ffmpeg command to re-encode a concat list using project defaults.
+
+    This reuses the project's default decisions where possible: CRF mapping via
+    `map_quality_to_crf()`, `--threads`, audio handling (`--copy-audio`),
+    `--max-width`/`--max-height` scaling, pixel format and container flags.
+    """
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        args.log_level.lower(),
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        concat_path,
+    ]
+
+    # Use centralized encoder selection for CRF (software) mode
+    try:
+        vcodec, crf_val, _, _ = select_encoder_settings(args, mode="crf")
+    except RuntimeError as e:
+        LOG.error(str(e))
+        LOG.error("no suitable software encoder found. Aborting.")
+        return []
+
+    # Reuse the shared tail builder so container flags, audio handling,
+    # scaling, threads and progress behavior remain consistent.
+    tail = build_encode_tail(
+        args,
+        has_video=True,
+        has_audio=True,
+        vcodec=vcodec,
+        crf=crf_val,
+        out_path=out_path,
+        preset="fast",
+    )
+
+    cmd += tail
+    return cmd
+
+
+def build_encode_tail(
+    args,
+    has_video: bool,
+    has_audio: bool,
+    *,
+    vcodec=None,
+    crf=None,
+    bitrate_kbps=None,
+    tmp_path=None,
+    chunking=False,
+    tmp_pattern=None,
+    out_path=None,
+    preset=None,
+):
+    """Build the tail (options + output) for an ffmpeg encode command.
+
+    This is the shared logic used by `process_file()` and the concat re-encode
+    fallback so both use the same decisions for threads, scaling, audio, pixel
+    format and container flags.
+    """
+    tail = []
+
+    # map video/audio/subs explicitly. When any -map is used, ffmpeg
+    # disables automatic mapping so we must include video when present.
+    if has_video:
+        tail += ["-map", "0:v?"]
+    tail += ["-map", "0:a?"]
+    tail += ["-map", "0:s?"]
+
+    # Video encoding selection - rely on caller-provided tokens/values
+    if has_video:
+        if crf is not None and vcodec is not None:
+            preset_val = preset or "veryslow"
+            tail += ["-c:v", vcodec, "-preset", preset_val, "-crf", str(crf)]
+        elif bitrate_kbps is not None and vcodec is not None:
+            tail += ["-c:v", vcodec, "-b:v", f"{int(bitrate_kbps)}k"]
+        elif vcodec is not None:
+            tail += ["-c:v", vcodec]
+
+    # threads
+    if getattr(args, "threads", None) is not None:
+        try:
+            tail += ["-threads", str(int(args.threads))]
+        except Exception:
+            pass
+
+    # Scaling filter
+    if (
+        getattr(args, "max_width", None) is not None
+        or getattr(args, "max_height", None) is not None
+    ):
+        mw = args.max_width or "iw"
+        mh = args.max_height or "ih"
+        vf = f"scale='min({mw},iw)':'min({mh},ih)':force_original_aspect_ratio=decrease"
+        tail += ["-vf", vf]
+
+    # Audio handling
+    if has_audio:
+        if getattr(args, "copy_audio", False):
+            tail += ["-c:a", "copy"]
+        else:
+            tail += ["-c:a", "aac", "-b:a", "128k"]
+
+    tail += ["-pix_fmt", "yuv420p"]
+
+    # container flags for mp4/mov
+    if getattr(args, "suffix", None) in ("mp4", "mov"):
+        tail += ["-movflags", "+faststart"]
+
+    # progress reporting
+    tail += ["-progress", "pipe:1", "-nostats"]
+
+    # chunking vs single output
+    if chunking and tmp_pattern:
+        # force key frames at boundaries for cleaner cuts
+        # prefer explicit seconds if provided, fall back to minutes for backward compatibility
+        try:
+            seg_seconds = int(getattr(args, "chunk_seconds", 0) or 0)
+        except Exception:
+            seg_seconds = 0
+        if not seg_seconds:
+            try:
+                seg_seconds = int(getattr(args, "chunk_minutes", 0) or 0) * 60
             except Exception:
                 seg_seconds = 0
         seg_seconds = max(1, seg_seconds)
