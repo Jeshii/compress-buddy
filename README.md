@@ -178,6 +178,96 @@ python compress_buddy.py --dry-run -o C:\tmp test.mp4
 python compress_buddy.py -o C:\tmp test.mp4
 ```
 
+### Windows
+
+- **1) Install Python 3.8+**
+
+	- Download the latest Windows installer from https://www.python.org/downloads/windows and run it.
+	- On the first installer screen, check "Add Python 3.x to PATH", then choose "Install Now". This puts `python` and `pip` on your PATH so PowerShell can run them directly.
+
+- **2) Verify Python is on PATH**
+
+	- Open PowerShell (press Windows, type PowerShell, press Enter) and run:
+
+		```powershell
+		python --version
+		pip --version
+		```
+
+	- You should see version strings (for example `Python 3.11.4`). If not, re-run the installer and ensure the "Add to PATH" option is checked.
+
+- **3) Install ffmpeg and ffprobe**
+
+	Option A — Manual (recommended for control):
+
+	- Download a static build ("essentials" or "full") from https://www.gyan.dev/ffmpeg/builds/.
+	- Extract the zip to a folder such as `C:\ffmpeg` so the binaries live at `C:\ffmpeg\bin\ffmpeg.exe` and `C:\ffmpeg\bin\ffprobe.exe`.
+
+	Option B — Automatic (winget):
+
+	- In PowerShell you can run:
+
+		```powershell
+		winget install --id=Gyan.FFmpeg -e --source winget
+		```
+
+- **4) Add ffmpeg to PATH (if you installed manually)**
+
+	- Run this PowerShell snippet to add `C:\ffmpeg\bin` to your user PATH (change path if you extracted elsewhere):
+
+		```powershell
+		$userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+		if ($userPath -notlike '*C:\ffmpeg\bin*') {
+			[Environment]::SetEnvironmentVariable('PATH', "$userPath;C:\ffmpeg\bin", 'User')
+		}
+		```
+
+	- Close and re-open PowerShell to pick up the updated PATH.
+
+- **5) Verify ffmpeg and ffprobe**
+
+	- Run:
+
+		```powershell
+		where.exe ffmpeg
+		where.exe ffprobe
+		ffmpeg -version
+		ffmpeg -encoders | findstr /R /C:"libx264" /C:"libx265" /C:"nvenc" /C:"qsv"
+		```
+
+	- Confirm the commands print paths and a version. If encoders are missing, download the "full" ffmpeg build instead of "essentials".
+
+- **6) Clone the repo and run compress-buddy**
+
+	- From PowerShell:
+
+		```powershell
+		git clone https://github.com/Jeshii/compress-buddy.git
+		cd compress-buddy
+		# dry-run to confirm decisions (no ffmpeg executed)
+		python compress_buddy.py --dry-run -o C:\tmp example.mp4
+		# real run
+		python compress_buddy.py -o C:\tmp example.mp4
+		```
+
+- **7) If `python` is not recognized after install**
+
+	- The installer may have skipped adding Python to PATH. Find your Python install folder (for example `C:\Users\<you>\AppData\Local\Programs\Python\Python311`) and add both the base and `Scripts` directories to the user PATH using the snippet in step 4.
+
+- **8) Long path and permission notes**
+
+	- Avoid deeply nested directories to prevent Windows path-length issues (>260 characters). Use shorter paths like `C:\tmp` when troubleshooting.
+	- If you get permission errors, try running PowerShell as Administrator or choose an output folder under your user profile.
+
+- **9) Example PowerShell session**
+
+	```powershell
+	python --version
+	where.exe ffmpeg
+	python compress_buddy.py --dry-run -o C:\Users\Public\Videos test.mp4
+	python compress_buddy.py -o C:\Users\Public\Videos test.mp4
+	```
+
 ## Troubleshooting
 
 - If you see errors about unknown encoders, try installing `ffmpeg-full`, install an ffmpeg build with the required encoders (e.g., `libx264`, `libx265`)

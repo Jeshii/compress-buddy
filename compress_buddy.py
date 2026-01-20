@@ -21,6 +21,7 @@ Options:
     --delete-original              Delete original after successful encode (use with caution)
     --output /path/to/outdir       Place converted files into this directory
     --chunk-minutes N              Split output into N-minute chunks
+    --chunk-seconds N              Split output into N-second chunks
     --log-level LEVEL              Set log level (DEBUG, INFO, WARNING, ERROR)
     --threads N                    Pass `-threads N` to ffmpeg to limit encoder threads
     --force-encoder ENCODER        Force exact ffmpeg encoder token to use (e.g. hevc_videotoolbox, h264_nvenc)
@@ -62,12 +63,14 @@ import json
 import logging
 import os
 import platform
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -199,7 +202,7 @@ def choose_best_hw_encoder(preferred: str):
     hwaccels = get_ffmpeg_hwaccels()
 
     def nvenc_available():
-        # try to find and load libcuda; libcuda.so.1 is common
+        # try to find and load libcuda (libcuda.so.1?)
         try:
             lib = ctypes.util.find_library("cuda")
             if lib:
@@ -478,12 +481,22 @@ def build_encode_tail(
     # chunking vs single output
     if chunking and tmp_pattern:
         # force key frames at boundaries for cleaner cuts
+        # prefer explicit seconds if provided, fall back to minutes for backward compatibility
         try:
-            seg_seconds = int(getattr(args, "chunk_minutes", 0)) * 60
+            seg_seconds = int(getattr(args, "chunk_seconds", 0) or 0)
         except Exception:
             seg_seconds = 0
+        if not seg_seconds:
+            try:
+                seg_seconds = int(getattr(args, "chunk_minutes", 0) or 0) * 60
+            except Exception:
+                seg_seconds = 0
         seg_seconds = max(1, seg_seconds)
         tail += ["-force_key_frames", f"expr:gte(t,n_forced*{seg_seconds})"]
+        # Ensure per-segment MP4/MOV have moov atom fronted so importers (Photos) can read them.
+        if getattr(args, "suffix", None) in ("mp4", "mov"):
+            seg_fmt = getattr(args, "suffix")
+            tail += ["-segment_format", seg_fmt, "-segment_format_options", "movflags=+faststart"]
         tail += [
             "-f",
             "segment",
@@ -629,101 +642,127 @@ def run_ffmpeg_with_progress(cmd, total_duration=None):
     final_out_time = 0.0
     stdout_lines = []
     stderr_lines = []
-    # last time we wrote a live status line (throttle updates)
     last_status_write = 0.0
-    # last percent value printed (float 0.0-100.0), used to avoid regressing progress display
     last_pct_printed = -1.0
     current_speed = 0.0
 
+    # Use threads to read stdout and stderr concurrently to avoid deadlocks
+    q_out = queue.Queue()
+    q_err = queue.Queue()
+
+    def _reader_thread(stream, q):
+        try:
+            for line in iter(stream.readline, ""):
+                q.put(line)
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    t_out = threading.Thread(
+        target=_reader_thread, args=(proc.stdout, q_out), daemon=True
+    )
+    t_err = threading.Thread(
+        target=_reader_thread, args=(proc.stderr, q_err), daemon=True
+    )
+    t_out.start()
+    t_err.start()
+
+    def _compute_progress_fields(out_time_val, start_ts, total_dur):
+        try:
+            elapsed_now = max(1e-6, time.time() - start_ts)
+            current_speed_local = out_time_val / elapsed_now if elapsed_now > 0 else 0.0
+        except Exception:
+            current_speed_local = 0.0
+        pct = "?"
+        eta_txt = "?"
+        pct_val = None
+        try:
+            if total_dur and total_dur > 0:
+                pct_val = min(100.0, (out_time_val / total_dur) * 100.0)
+                pct = f"{pct_val:5.1f}%"
+                if current_speed_local > 0:
+                    remaining = max(0.0, total_dur - out_time_val)
+                    eta_seconds = remaining / current_speed_local
+                    hrs = int(eta_seconds // 3600)
+                    mins = int((eta_seconds % 3600) // 60)
+                    secs = int(eta_seconds % 60)
+                    if hrs:
+                        eta_txt = f"{hrs}:{mins:02d}:{secs:02d}"
+                    else:
+                        eta_txt = f"{mins:02d}:{secs:02d}"
+        except Exception:
+            pass
+        return pct, eta_txt, current_speed_local, pct_val
+
+    def _write_progress_line(pct_str, eta_str, speed_val):
+        try:
+            import sys
+
+            sys.stderr.write(
+                f"\r{pct_str} ETA {eta_str} | Encode speed: {speed_val:.2f}x    "
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    def _handle_progress_line(out_line):
+        nonlocal final_out_time, last_status_write, last_pct_printed, current_speed
+        LOG.debug(f"\nffmpeg stdout: {out_line.strip()}")
+        stdout_lines.append(out_line)
+        line = out_line.strip()
+        if "=" in line:
+            key, val = line.split("=", 1)
+            if key == "out_time":
+                try:
+                    final_out_time = parse_out_time(val.strip())
+                    if time.time() - last_status_write > 0.5:
+                        pct, eta_txt, current_speed, pct_val = _compute_progress_fields(
+                            final_out_time, start, total_duration
+                        )
+                        try:
+                            if pct_val is None or pct_val >= last_pct_printed:
+                                _write_progress_line(pct, eta_txt, current_speed)
+                                if pct_val is not None:
+                                    last_pct_printed = pct_val
+                                last_status_write = time.time()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
     try:
-
-        def _compute_progress_fields(out_time_val, start_ts, total_dur):
-            """Return (pct_str, eta_text, current_speed, pct_val) for given out_time in seconds.
-
-            pct_val is a float 0.0-100.0 when total_dur is known, otherwise None.
-            """
-            try:
-                elapsed_now = max(1e-6, time.time() - start_ts)
-                current_speed_local = (
-                    out_time_val / elapsed_now if elapsed_now > 0 else 0.0
-                )
-            except Exception:
-                current_speed_local = 0.0
-            pct = "?"
-            eta_txt = "?"
-            pct_val = None
-            try:
-                if total_dur and total_dur > 0:
-                    pct_val = min(100.0, (out_time_val / total_dur) * 100.0)
-                    pct = f"{pct_val:5.1f}%"
-                    if current_speed_local > 0:
-                        remaining = max(0.0, total_dur - out_time_val)
-                        eta_seconds = remaining / current_speed_local
-                        hrs = int(eta_seconds // 3600)
-                        mins = int((eta_seconds % 3600) // 60)
-                        secs = int(eta_seconds % 60)
-                        if hrs:
-                            eta_txt = f"{hrs}:{mins:02d}:{secs:02d}"
-                        else:
-                            eta_txt = f"{mins:02d}:{secs:02d}"
-            except Exception:
-                pass
-            return pct, eta_txt, current_speed_local, pct_val
-
-        def _write_progress_line(pct_str, eta_str, speed_val):
-            try:
-                import sys
-
-                sys.stderr.write(
-                    f"\r{pct_str} ETA {eta_str} | Encode speed: {speed_val:.2f}x    "
-                )
-                sys.stderr.flush()
-            except Exception:
-                pass
-
-        def _handle_progress_line(out_line):
-            nonlocal final_out_time, last_status_write, last_pct_printed, current_speed
-            LOG.debug(f"ffmpeg stdout: {out_line.strip()}")
-            stdout_lines.append(out_line)
-            line = out_line.strip()
-            if "=" in line:
-                key, val = line.split("=", 1)
-                if key == "out_time":
-                    try:
-                        final_out_time = parse_out_time(val.strip())
-                        # compute current speed and update a single-line status (throttled)
-                        if time.time() - last_status_write > 0.5:
-                            pct, eta_txt, current_speed, pct_val = (
-                                _compute_progress_fields(
-                                    final_out_time, start, total_duration
-                                )
-                            )
-                            try:
-                                if pct_val is None or pct_val >= last_pct_printed:
-                                    _write_progress_line(pct, eta_txt, current_speed)
-                                    if pct_val is not None:
-                                        last_pct_printed = pct_val
-                                    last_status_write = time.time()
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-
+        # main loop: drain both queues until process exits and queues are empty
         while True:
-            out_line = proc.stdout.readline()
-            if out_line:
+            try:
+                # prefer stdout lines first (progress uses stdout)
+                out_line = q_out.get(timeout=0.1)
+            except queue.Empty:
+                out_line = None
+
+            if out_line is not None:
                 _handle_progress_line(out_line)
-                continue
+
+            # drain any stderr available
+            while True:
+                try:
+                    err_line = q_err.get_nowait()
+                    stderr_lines.append(err_line)
+                    LOG.debug(f"ffmpeg stderr: {err_line.strip()}")
+                except queue.Empty:
+                    break
+
+            # break when process has exited and both queues are empty
             if proc.poll() is not None:
-                # drain remaining stdout
-                for out_line in proc.stdout:
-                    _handle_progress_line(out_line)
+                # drain remaining queued lines
+                while not q_out.empty():
+                    _handle_progress_line(q_out.get())
+                while not q_err.empty():
+                    line = q_err.get()
+                    stderr_lines.append(line)
+                    LOG.debug(f"ffmpeg stderr: {line.strip()}")
                 break
-                # drain a bit of stderr to avoid blocking if ffmpeg writes a lot
-            err_chunk = proc.stderr.readline()
-            if err_chunk:
-                stderr_lines.append(err_chunk)
-                LOG.debug(f"ffmpeg stderr: {err_chunk.strip()}")
         proc.wait()
     except KeyboardInterrupt:
         proc.kill()
@@ -733,11 +772,13 @@ def run_ffmpeg_with_progress(cmd, total_duration=None):
     elapsed = max(1e-6, time.time() - start)
     final_speed = final_out_time / elapsed if elapsed > 0 else 0.0
 
-    # collect remaining stderr
+    # join reader threads (they will exit once streams are closed)
     try:
-        stderr_rest = proc.stderr.read()
-        if stderr_rest:
-            stderr_lines.append(stderr_rest)
+        t_out.join(timeout=0.1)
+    except Exception:
+        pass
+    try:
+        t_err.join(timeout=0.1)
     except Exception:
         pass
 
@@ -855,8 +896,12 @@ def process_concat_list(concat_path: str, inputs: list, args):
             out_dir = Path(inputs[0]).parent
             out = out_dir / ("joined." + args.suffix)
 
-        chunk_minutes = getattr(args, "chunk_minutes", 0) or 0
-        chunking = int(chunk_minutes) > 0
+        # prefer explicit seconds flag when present
+        chunk_seconds = int(getattr(args, "chunk_seconds", 0) or 0)
+        if not chunk_seconds:
+            chunk_minutes = getattr(args, "chunk_minutes", 0) or 0
+            chunk_seconds = int(chunk_minutes) * 60
+        chunking = int(chunk_seconds) > 0
 
         tmp_dir = None
         tmp_path = None
@@ -919,8 +964,34 @@ def process_concat_list(concat_path: str, inputs: list, args):
         # Honor dry-run: log the final ffmpeg command and do not execute it.
         if getattr(args, "dry_run", False):
             LOG.info("(dry-run) Would run: %s", format_cmd_for_logging(cmd))
-            # In dry-run mode we don't produce files; return early
+            # In dry-run mode we don't produce files
             return
+
+        # compute total duration (sum of input durations) so progress %/ETA can be computed
+        total_duration = 0.0
+        try:
+            for f in inputs:
+                try:
+                    _, d, _, _ = compute_bitrate_and_duration(f)
+                    total_duration += float(d or 0.0)
+                except Exception:
+                    # ignore individual probe failures
+                    pass
+        except Exception:
+            total_duration = None
+
+        # compute combined original size for logging
+        try:
+            orig_size = 0
+            for f in inputs:
+                try:
+                    p = Path(f)
+                    if p.exists():
+                        orig_size += p.stat().st_size
+                except Exception:
+                    pass
+        except Exception:
+            orig_size = None
 
         success, speed, elapsed_sec, final_out_time = encode_and_handle_output(
             cmd,
@@ -931,8 +1002,8 @@ def process_concat_list(concat_path: str, inputs: list, args):
             tmp_dir=tmp_dir,
             tmp_pattern=tmp_pattern,
             chunking=chunking,
-            total_duration=None,
-            orig_size=None,
+            total_duration=total_duration,
+            orig_size=orig_size,
         )
         if not success:
             sys.exit(1)
@@ -1000,9 +1071,30 @@ def process_file(path, args):
         out = out_dir / inp.with_suffix(f".{args.suffix}").name
     else:
         out = inp.with_suffix(f".{args.suffix}")
-    if out.exists() and not args.overwrite:
-        LOG.warning(f"{out.name} exists, skipping... (use --overwrite to replace)")
-        return
+    try:
+        # If the output exists and overwrite not requested, normally skip.
+        # However, when the output path is the same file as the input (this
+        # happens during the quick-join flow where we concat to a temporary
+        # joined file then process that same path), we should not skip.
+        if out.exists() and not args.overwrite:
+            try:
+                if out.resolve() == inp.resolve():
+                    # output is the same file as input — continue processing
+                    pass
+                else:
+                    LOG.warning(
+                        f"{out.name} exists, skipping... (use --overwrite to replace)"
+                    )
+                    return
+            except Exception:
+                # If resolve() fails for any reason, fall back to conservative skip
+                LOG.warning(
+                    f"{out.name} exists, skipping... (use --overwrite to replace)"
+                )
+                return
+    except Exception:
+        # If any filesystem check fails, continue and let later operations surface errors
+        pass
 
     bitrate, duration, probe, bitrate_source = compute_bitrate_and_duration(inp)
     if bitrate is None:
@@ -1027,7 +1119,7 @@ def process_file(path, args):
         if (args.max_width is not None or args.max_height is not None) and video_stream:
             in_w = int(video_stream.get("width") or 0)
             in_h = int(video_stream.get("height") or 0)
-            # determine output dims based on provided max dimensions; infer missing dimension from input aspect
+            # determine output dims based on provided max dimensions
             mw = args.max_width
             mh = args.max_height
             if in_w and in_h:
@@ -1077,7 +1169,7 @@ def process_file(path, args):
     try:
         if args.mode == "hardware" and getattr(args, "quality", None) is not None:
             LOG.info(
-                "Hardware mode with explicit quality provided; skipping motion-based bitrate adjustment"
+                "Hardware mode with explicit quality provided, skipping motion-based bitrate adjustment..."
             )
             motion_mult = 1.0
         elif args.motion_multiplier is not None:
@@ -1100,7 +1192,7 @@ def process_file(path, args):
         # floor at 0.5 to avoid producing unusably low target bitrates
         if scale_multiplier < 0.5:
             LOG.debug(
-                "scale_multiplier %.3f is below minimum; clamping to 0.5",
+                "scale_multiplier %.3f is below minimum so clamping to 0.5",
                 scale_multiplier,
             )
             scale_multiplier = 0.5
@@ -1177,8 +1269,12 @@ def process_file(path, args):
 
     # prepare output parent and chunking parameters
     out.parent.mkdir(parents=True, exist_ok=True)
-    chunk_minutes = getattr(args, "chunk_minutes", 0) or 0
-    chunking = int(chunk_minutes) > 0
+    # prefer explicit seconds flag when present; fall back to minutes for backward compatibility
+    chunk_seconds = int(getattr(args, "chunk_seconds", 0) or 0)
+    if not chunk_seconds:
+        chunk_minutes = getattr(args, "chunk_minutes", 0) or 0
+        chunk_seconds = int(chunk_minutes) * 60
+    chunking = int(chunk_seconds) > 0
     tmp_dir = None
     tmp_path = None
     tmp_pattern = None
@@ -1187,7 +1283,7 @@ def process_file(path, args):
         tmp_dir = Path(tempfile.mkdtemp(prefix=out.name + ".", dir=str(out.parent)))
         # ffmpeg will write segments into this directory
         tmp_pattern = str(tmp_dir / (inp.stem + ".%03d" + out.suffix))
-        LOG.debug("Segmenting into %s (chunk %dm)", tmp_pattern, chunk_minutes)
+        LOG.debug("Segmenting into %s (chunk %ds)", tmp_pattern, chunk_seconds)
     else:
         # create a named temp file in the same directory as the output so atomic replace works across filesystems
         # Use the output stem (name without suffix) as the prefix so the suffix is not duplicated
@@ -1386,7 +1482,7 @@ def main(argv):
                 setattr(args, "_hwaccel", hwaccel)
             else:
                 LOG.error(
-                    "No suitable hardware encoder found; no override provided. Aborting. Run with --mode crf for software encoding or --force-encoder to pick one."
+                    "No suitable hardware encoder found. Aborting. Run with --mode crf for software encoding or --force-encoder to pick one."
                 )
                 encs = sorted(get_ffmpeg_encoders())
                 hw = sorted(get_ffmpeg_hwaccels())
@@ -1420,7 +1516,7 @@ def main(argv):
             cores = os.cpu_count() or 1
             per = max(1, cores // int(args.workers))
             args.threads = per
-            # Defer informational logging until logging is configured; store a flag
+            # Defer informational logging until logging is configured
             setattr(args, "_threads_auto", True)
             LOG.debug(
                 f"Auto-setting --threads {per} per worker (total CPU cores: {cores})"
@@ -1436,6 +1532,12 @@ def main(argv):
 
     files = args.files
     quick_joined_path = None
+    quick_join_orig_files = None
+    # When True we will remove the quick-joined intermediate on exit
+    # Set to True when quick-join is created as an internal intermediate that will
+    # be processed. If the quick-joined file is intended as final output we
+    # set this to False to preserve it.
+    quick_join_delete_on_exit = False
 
     # Handle --quick_join: concatenate all inputs into a single temp file first
     if getattr(args, "quick_join", False):
@@ -1450,6 +1552,9 @@ def main(argv):
             joined_tmp = None
             concat_path = None
             try:
+                # Remember original inputs so we can delete them later if
+                # requested and we decide to skip further processing.
+                quick_join_orig_files = list(files)
                 # Try to create the concat list next to the first input so users
                 # can inspect it while the job runs. Fall back to system temp
                 # directory on any failure (permissions, non-existent parent, etc.).
@@ -1473,7 +1578,7 @@ def main(argv):
                 LOG.info(f"Writing concat list to: {concat_path}")
                 with os.fdopen(concat_fd, "w") as cf:
                     for f in files:
-                        # ffmpeg concat demuxer requires absolute paths; quote when needed
+                        # ffmpeg concat demuxer requires absolute paths
                         abs_path = Path(f).resolve()
                         ap = str(abs_path)
                         # If the path contains a single quote, use double quotes around it
@@ -1506,7 +1611,19 @@ def main(argv):
                 LOG.info(f"Concatenating to: {joined_path}")
 
                 if not args.dry_run:
-                    # Run ffmpeg concat using run_cmd() to ensure standardized logging
+                    # Compute total duration (sum of input durations) so progress can be shown
+                    total_duration = 0.0
+                    try:
+                        for f in quick_join_orig_files:
+                            try:
+                                _, dur, _, _ = compute_bitrate_and_duration(Path(f))
+                                total_duration += float(dur or 0.0)
+                            except Exception:
+                                LOG.debug(f"Could not determine duration for {f}")
+                    except Exception:
+                        total_duration = None
+
+                    # Run ffmpeg concat with progress so we can show ETA/%%/speed
                     concat_cmd = [
                         "ffmpeg",
                         "-y",
@@ -1521,17 +1638,29 @@ def main(argv):
                         concat_path,
                         "-c",
                         "copy",
+                        "-progress",
+                        "pipe:1",
+                        "-nostats",
                         str(joined_tmp),
                     ]
 
-                    result = run_cmd(concat_cmd)
+                    rc, _, stderr_text, speed, elapsed_sec, final_out_time = (
+                        run_ffmpeg_with_progress(
+                            concat_cmd, total_duration=total_duration
+                        )
+                    )
 
-                    if result.returncode != 0:
-                        # Copy-based concat failed, inform user and abort
+                    if rc != 0:
                         LOG.error("Copy-based concat failed, aborting quick-join...")
+                        LOG.debug(f"ffmpeg stderr:\n{stderr_text}")
+                        try:
+                            if joined_tmp and joined_tmp.exists():
+                                joined_tmp.unlink(missing_ok=True)
+                        except Exception:
+                            pass
                         sys.exit(1)
 
-                        # Move to final location (respect --overwrite)
+                    # Move to final location (respect --overwrite)
                     if joined_path.exists() and not args.overwrite:
                         LOG.error(
                             f"{joined_path.name} exists and --overwrite not set. Aborting quick-join."
@@ -1545,9 +1674,11 @@ def main(argv):
                     os.replace(joined_tmp, joined_path)
                     LOG.info(f"Successfully joined videos into: {joined_path}")
 
-                    # Now process the joined file
+                    # Now process the joined file (by default we plan to process it)
                     files = [str(joined_path)]
                     quick_joined_path = Path(joined_path)
+                    # By default, mark this as an intermediate we will delete on exit
+                    quick_join_delete_on_exit = True
                 else:
                     LOG.info(
                         f"(dry-run) Would join {len(files)} files into {joined_path}"
@@ -1602,7 +1733,7 @@ def main(argv):
                     LOG.info(f"Writing concat list to: {concat_path}")
                     with os.fdopen(concat_fd, "w") as cf:
                         for f in files:
-                            # ffmpeg concat demuxer requires absolute paths; quote when needed
+                            # ffmpeg concat demuxer requires absolute paths
                             abs_path = Path(f).resolve()
                             ap = str(abs_path)
                             if "'" in ap:
@@ -1619,7 +1750,45 @@ def main(argv):
                     except Exception:
                         pass
             else:
+                # If we created a quick-joined intermediate and the user did not
+                # request any additional processing flags, treat the quick-join
+                # as the final output and skip re-processing. This avoids
+                # re-encoding a file when the intent was only a copy-based join.
+                skip_processing = False
+                if quick_joined_path and quick_join_orig_files:
+                    # Detect a set of flags that imply further processing.
+                    extra_flags = any(
+                        (
+                            getattr(args, "max_width", None) is not None,
+                            getattr(args, "max_height", None) is not None,
+                            (int(getattr(args, "chunk_seconds", 0) or 0) > 0) or (getattr(args, "chunk_minutes", 0) > 0),
+                            getattr(args, "delete_original", False),
+                            getattr(args, "output", None) is not None,
+                            getattr(args, "overwrite", False),
+                            getattr(args, "motion_multiplier", None) is not None,
+                            getattr(args, "quality", None) is not None,
+                            getattr(args, "copy_audio", False),
+                            getattr(args, "mode", None) == "crf",
+                            getattr(args, "threads", None) is not None,
+                        )
+                    )
+                    # if any True then we should process
+                    if not any(extra_flags):
+                        LOG.info(
+                            "Quick-join completed and no processing flags provided, skipping re-encoding step."
+                        )
+                        skip_processing = True
+                        # Preserve the joined file as final output
+                        quick_join_delete_on_exit = False
+
                 for f in files:
+                    if (
+                        skip_processing
+                        and quick_joined_path
+                        and Path(f) == quick_joined_path
+                    ):
+                        # Skip processing the joined intermediate
+                        continue
                     try:
                         process_file(f, args)
                     except Exception as e:
@@ -1630,9 +1799,13 @@ def main(argv):
     finally:
         # Clean up quick-joined intermediate if created (it's an internal temp)
         try:
-            if quick_joined_path and quick_joined_path.exists():
+            if (
+                quick_joined_path
+                and quick_joined_path.exists()
+                and quick_join_delete_on_exit
+            ):
                 quick_joined_path.unlink(missing_ok=True)
-                LOG.debug(f"Removed temporary quick-joined file {quick_joined_path}")
+                LOG.info(f"Removed temporary quick-joined file: {quick_joined_path}")
         except Exception:
             pass
 
@@ -1712,14 +1885,20 @@ def arg_parse(argv):
         help="split output into N-minute chunks",
     )
     p.add_argument(
+        "--chunk-seconds",
+        type=int,
+        default=0,
+        help="split output into N-second chunks (preferred over minutes)",
+    )
+    p.add_argument(
         "--join",
         action="store_true",
-        help="join all input videos into a single file before processing (works with --chunk-minutes)",
+        help="join all input videos into a single file before processing",
     )
     p.add_argument(
         "--quick-join",
         action="store_true",
-        help="Quickly join inputs with a copy-based concat (-c copy) and then process the result; fails if inputs incompatible",
+        help="Quickly join inputs with a copy-based concat (-c copy) and then process the result if other flags are provided.",
     )
     p.add_argument(
         "--log-level",
@@ -1818,7 +1997,7 @@ def arg_parse(argv):
 
     # Prevent using both join modes simultaneously
     if args.join and args.quick_join:
-        p.error("--join and --quick-join are mutually exclusive; choose one")
+        p.error("--join and --quick-join are mutually exclusive")
 
     if args.quality is not None:
         try:
