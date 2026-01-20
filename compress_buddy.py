@@ -496,7 +496,12 @@ def build_encode_tail(
         # Ensure per-segment MP4/MOV have moov atom fronted so importers (Photos) can read them.
         if getattr(args, "suffix", None) in ("mp4", "mov"):
             seg_fmt = getattr(args, "suffix")
-            tail += ["-segment_format", seg_fmt, "-segment_format_options", "movflags=+faststart"]
+            tail += [
+                "-segment_format",
+                seg_fmt,
+                "-segment_format_options",
+                "movflags=+faststart",
+            ]
         tail += [
             "-f",
             "segment",
@@ -1761,7 +1766,8 @@ def main(argv):
                         (
                             getattr(args, "max_width", None) is not None,
                             getattr(args, "max_height", None) is not None,
-                            (int(getattr(args, "chunk_seconds", 0) or 0) > 0) or (getattr(args, "chunk_minutes", 0) > 0),
+                            (int(getattr(args, "chunk_seconds", 0) or 0) > 0)
+                            or (getattr(args, "chunk_minutes", 0) > 0),
                             getattr(args, "delete_original", False),
                             getattr(args, "output", None) is not None,
                             getattr(args, "overwrite", False),
