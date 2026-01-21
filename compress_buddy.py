@@ -260,14 +260,13 @@ def get_software_vcodec_name(codec_hint: str) -> str:
     return "libx264"
 
 
-def select_encoder_settings(args, mode: str, target_kbps: int | None = None):
+def select_encoder_settings(args, mode: str) -> str:
     """Centralize encoder selection decisions.
 
-    Returns tuple: (vcodec: str | None, crf: int | None, bitrate_kbps: int | None, quality: int | None)
+    Returns encoder
 
-    - For CRF mode: returns a software `libx264`/`libx265` token and mapped CRF.
-    - For hardware mode: returns `args.codec` as the encoder token and a bitrate target
-      (unless `args.quality` is provided, in which case `quality` is returned for hw encoders).
+    - For CRF mode: returns a software `libx264`/`libx265` token.
+    - For hardware mode: returns `args.codec` as the encoder token.
 
     Raises RuntimeError on unrecoverable selection failures (missing encoders).
     """
@@ -285,22 +284,16 @@ def select_encoder_settings(args, mode: str, target_kbps: int | None = None):
                 raise RuntimeError(
                     f"Neither libx265 nor libx264 available in ffmpeg encoders: {', '.join(sorted(list(available_encs))[:40]) or '<none>'}"
                 )
-        crf_val = map_quality_to_crf(getattr(args, "quality", None) or 45)
-        return req_enc, crf_val, None, None
+        return req_enc
 
     # hardware or bitrate-driven mode
     enc = getattr(args, "codec", None)
     if not enc:
         # default to codec hint
         enc = "h264"
-    # If the caller wants a quality hint for hw encoders, we return it separately
-    hw_quality = getattr(args, "quality", None)
-    if hw_quality is not None:
-        # hardware encoders generally accept -q:v
-        return enc, None, None, hw_quality
 
     # otherwise target a bitrate
-    return enc, None, int(target_kbps) if target_kbps is not None else None, None
+    return enc
 
 
 def run_cmd(cmd):
@@ -384,7 +377,8 @@ def build_reencode_cmd_for_concat(concat_path: str, out_path: Path, args) -> lis
 
     # Use centralized encoder selection for CRF (software) mode
     try:
-        vcodec, crf_val, _, _ = select_encoder_settings(args, mode="crf")
+        vcodec = select_encoder_settings(args, mode="crf")
+        crf_val = map_quality_to_crf(getattr(args, "quality", None))
     except RuntimeError as e:
         LOG.error(str(e))
         LOG.error("no suitable software encoder found. Aborting.")
@@ -392,14 +386,19 @@ def build_reencode_cmd_for_concat(concat_path: str, out_path: Path, args) -> lis
 
     # Reuse the shared tail builder so container flags, audio handling,
     # scaling, threads and progress behavior remain consistent.
+    tail_kwargs = {
+        "has_video": True,
+        "has_audio": True,
+        "vcodec": vcodec,
+        "out_path": out_path,
+        "preset": "veryslow",
+    }
+    if crf_val is not None:
+        tail_kwargs["crf"] = crf_val
+
     tail = build_encode_tail(
         args,
-        has_video=True,
-        has_audio=True,
-        vcodec=vcodec,
-        crf=crf_val,
-        out_path=out_path,
-        preset="fast",
+        **tail_kwargs,
     )
 
     cmd += tail
@@ -432,7 +431,8 @@ def build_encode_tail(
     # disables automatic mapping so we must include video when present.
     if has_video:
         tail += ["-map", "0:v?"]
-    tail += ["-map", "0:a?"]
+    if has_audio:
+        tail += ["-map", "0:a?"]
     tail += ["-map", "0:s?"]
 
     # Video encoding selection - rely on caller-provided tokens/values
@@ -615,6 +615,8 @@ def map_quality_to_crf(q):
     This performs a linear, inverted mapping where 100 -> 0 and 0 -> 51.
     Values are clamped to the valid ranges.
     """
+    if q is None:
+        return None
     try:
         qv = int(q)
     except Exception:
@@ -943,26 +945,27 @@ def process_concat_list(concat_path: str, inputs: list, args):
         crf_val = None
         bitrate_kbps = None
         try:
-            vcodec, crf_val, bitrate_kbps, _ = select_encoder_settings(
-                args, mode=args.mode, target_kbps=None
-            )
+            vcodec = select_encoder_settings(args, mode=args.mode)
+            crf_val = map_quality_to_crf(getattr(args, "quality", None))
         except RuntimeError as e:
             LOG.error(str(e))
             LOG.error("no suitable encoder found for concat-encode. Aborting.")
             return
 
-        tail = build_encode_tail(
-            args,
-            has_video=True,
-            has_audio=True,
-            vcodec=vcodec,
-            crf=crf_val,
-            bitrate_kbps=bitrate_kbps,
-            tmp_path=tmp_path,
-            chunking=chunking,
-            tmp_pattern=tmp_pattern,
-            out_path=out,
-        )
+        tail_kwargs = {
+            "has_video": True,
+            "has_audio": True,
+            "vcodec": vcodec,
+            "bitrate_kbps": bitrate_kbps,
+            "tmp_path": tmp_path,
+            "chunking": chunking,
+            "tmp_pattern": tmp_pattern,
+            "out_path": out,
+        }
+        if crf_val is not None:
+            tail_kwargs["crf"] = crf_val
+
+        tail = build_encode_tail(args, **tail_kwargs)
 
         cmd = top_cmd + tail
         LOG.info("Running concat-encode...")
@@ -1304,20 +1307,20 @@ def process_file(path, args):
             error_level=args.log_level.lower(),
         )
 
-        # keep video map if present
-        if has_video:
-            cmd += ["-map", "0:v:0"]
-
+        # Let the shared tail handle mapping and output placement. Only compute
+        # which encoder / mode values to pass into build_encode_tail so we avoid
+        # duplicated flags here.
         # Determine codec/bitrate decisions and let shared tail append the remaining flags
         tail_vcodec = None
         tail_crf = None
         tail_bitrate = None
+        tail_preset = None
 
         # Centralized encoder selection
         try:
-            sel_vcodec, sel_crf, sel_bitrate, sel_quality = select_encoder_settings(
-                args, mode=args.mode, target_kbps=target_kbps
-            )
+            sel_vcodec = select_encoder_settings(args, mode=args.mode)
+            sel_bitrate = target_kbps
+            sel_quality = map_quality_to_crf(getattr(args, "quality", None))
         except RuntimeError as e:
             LOG.error(str(e))
             try:
@@ -1329,32 +1332,14 @@ def process_file(path, args):
 
         if args.mode == "crf":
             # software encoder token and CRF mapped
-            cmd += ["-c:v", sel_vcodec]
-            cmd += ["-crf", str(sel_crf)]
-            LOG.info("Using CRF=%s (mapped from quality=%s)", sel_crf, args.quality)
+            tail_vcodec = sel_vcodec
+            tail_crf = sel_quality
+            tail_preset = "veryslow"
+            LOG.info("Using CRF=%s (mapped from quality=%s)", tail_crf, args.quality)
         else:
-            # hardware or bitrate-based mode
-            enc = sel_vcodec
-            if enc is None:
-                enc = args.codec
-            if any(
-                k in str(enc)
-                for k in ("nvenc", "qsv", "videotoolbox", "d3d11va", "dxva2")
-            ):
-                cmd += ["-c:v", str(enc)]
-            else:
-                cmd += ["-c:v", f"{enc}_videotoolbox"]
-            if sel_quality is not None:
-                cmd += ["-q:v", str(sel_quality)]
-            elif sel_bitrate is not None:
-                cmd += [
-                    "-b:v",
-                    f"{sel_bitrate}k",
-                    "-maxrate",
-                    f"{sel_bitrate}k",
-                    "-bufsize",
-                    f"{max(1000, sel_bitrate*2)}k",
-                ]
+            # hardware or bitrate-based mode: prefer bitrate targeting
+            tail_vcodec = sel_vcodec or args.codec
+            tail_bitrate = sel_bitrate
 
         # Build shared tail and append
         tail = build_encode_tail(
@@ -1368,6 +1353,7 @@ def process_file(path, args):
             chunking=chunking,
             tmp_pattern=tmp_pattern,
             out_path=out,
+            preset=tail_preset,
         )
 
         cmd += tail
