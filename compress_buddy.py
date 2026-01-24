@@ -10,12 +10,12 @@ Options:
     --quality N                    Quality value, 0 being worst and 100 being best (default None)
     --codec h264|h265              Codec to use (h264 for compatibility, h265 for better compression)
     --workers N                    Parallel workers (only for CRF mode)
-    --min-kbps N                   Minimum target bitrate in kbps (default 3000)
-    --max-kbps N                   Maximum target bitrate in kbps (default 8000)
+    --min-kbps N                   Minimum target bitrate in kbps
+    --max-kbps N                   Maximum target bitrate in kbps
     --dry-run                      Show actions but don't run final ffmpeg commands (will run some analysis)
     --overwrite                    Overwrite existing files
     --copy-audio                   Copy AAC audio instead of re-encoding
-    --suffix mp4|mov|mkv|avi       Output file suffix (default mov)
+    --suffix mp4|mov|mkv|avi       Output file suffix
     --max-width N                  Maximum output width in pixels (preserves aspect)
     --max-height N                 Maximum output height in pixels (preserves aspect)
     --delete-original              Delete original after successful encode (use with caution)
@@ -27,8 +27,8 @@ Options:
     --force-encoder ENCODER        Force exact ffmpeg encoder token to use (e.g. hevc_videotoolbox, h264_nvenc)
     --target-factor FACTOR         Target size factor relative to source bitrate (0.0 < FACTOR <= 1.0, default 0.7)
     --motion-multiplier MULT       Motion multiplier to adjust bitrate (default 1.0)
-    --join                         Join multiple input files into a single output
-    --quick-join                   Use quick concat method (no re-encoding, may fail on incompatible inputs)
+    --join                         Join all input videos into a single file before processing
+    --skip-processing              Skip processing of files (useful with --join to only join files)
 
 
 Notes:
@@ -38,13 +38,13 @@ Notes:
 
 Examples:
     # process specific files in place:
-    python3 compress_buddy.py video1.mov video2.mov
+    python3 compress_buddy.py video1.mp4 video2.mp4
 
     # place converted files into /tmp/outdir:
-    python3 compress_buddy.py -o /tmp/outdir *.mov
+    python3 compress_buddy.py -o /tmp/outdir *.mp4
 
     # dry-run to preview actions without running ffmpeg:
-    python3 compress_buddy.py --dry-run -o /tmp/outdir myvideo.mov
+    python3 compress_buddy.py --dry-run -o /tmp/outdir myvideo.mp4
 
     # run with 4 workers using CRF mode:
     python3 compress_buddy.py --workers 4 --mode crf --quality 28 *.mp4
@@ -53,12 +53,12 @@ Examples:
     python3 compress_buddy.py --chunk-minutes 15 -o /tmp/outdir mylongvideo.mov
 
     # output as AVI container:
-    python3 compress_buddy.py --suffix avi myvideo.mov
+    python3 compress_buddy.py --suffix avi myvideo.mp4
 
 """
 import argparse
-import ctypes
-import ctypes.util
+import configparser
+import glob
 import json
 import logging
 import os
@@ -97,10 +97,91 @@ def format_cmd_for_logging(cmd):
     return " ".join(shlex.quote(x) for x in cmd)
 
 
-def ensure_ffmpeg_available(dry_run: bool):
-    """Fail early if ffmpeg/ffprobe are missing, unless this is a dry-run."""
-    if dry_run:
-        return
+def load_user_config():
+    """Load user configuration from standard locations and return a dict of values.
+
+    Search order (first found wins):
+      - ./compress_buddy.ini (script directory)
+      - $XDG_CONFIG_HOME/compress_buddy/config.ini
+      - ~/.config/compress_buddy/config.ini
+      - ~/.compress_buddy.ini
+
+    Uses safe defaults if no config is present.
+    """
+    cfg_paths = []
+    script_dir = Path(__file__).resolve().parent
+    cfg_paths.append(script_dir / "compress_buddy.ini")
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        cfg_paths.append(Path(xdg) / "compress_buddy" / "config.ini")
+    cfg_paths.append(Path.home() / ".config" / "compress_buddy" / "config.ini")
+    cfg_paths.append(Path.home() / ".compress_buddy.ini")
+
+    defaults = {
+        "target_factor": 0.7,
+        "baseline_1080p_kbps": 8000.0,
+        "hevc_multiplier": 0.7,
+        "default_bit_depth": 10,
+        "judgement_upper": 1.15,
+        "judgement_lower": 0.85,
+        "res_factor_4k": 1.8,
+        "res_factor_1080p": 1.0,
+        "res_factor_720p": 0.6,
+        "res_factor_sd": 0.35,
+        "suffix": "mp4",
+    }
+
+    cp = configparser.ConfigParser()
+    found = None
+    for p in cfg_paths:
+        try:
+            if p.exists():
+                cp.read(p)
+                found = p
+                break
+        except Exception:
+            continue
+
+    out = defaults.copy()
+    if found and cp.has_section("defaults"):
+        sec = cp["defaults"]
+
+        def _getfloat(k):
+            try:
+                return float(sec.get(k, out[k]))
+            except Exception:
+                return out[k]
+
+        def _getbool(k):
+            try:
+                return sec.getboolean(k, fallback=out[k])
+            except Exception:
+                return out[k]
+
+        for k in (
+            "target_factor",
+            "baseline_1080p_kbps",
+            "hevc_multiplier",
+            "judgement_upper",
+            "judgement_lower",
+            "res_factor_4k",
+            "res_factor_1080p",
+            "res_factor_720p",
+            "res_factor_sd",
+            "default_bit_depth",
+            "suffix",
+        ):
+            out[k] = _getfloat(k)
+
+    return out
+
+
+# Global user config read at import time
+USER_CONFIG = load_user_config()
+
+
+def ensure_ffmpeg_available():
+    """Fail early if ffmpeg/ffprobe are missing"""
     ffmpeg_path = shutil.which("ffmpeg")
     ffprobe_path = shutil.which("ffprobe")
     if not ffmpeg_path or not ffprobe_path:
@@ -116,8 +197,10 @@ def get_ffmpeg_hwaccels():
     Returns empty set on error.
     """
     try:
-        command = ["ffmpeg", "-hide_banner", "-hwaccels"]
-        res = run_cmd(command)
+        cmd = ["ffmpeg", "-hide_banner", "-hwaccels"]
+        res = run_cmd(
+            cmd=cmd, dry_run=False  # always run hwaccels check, even in dry-run mode
+        )
         if res.returncode != 0:
             return set()
         lines = res.stdout.splitlines()
@@ -138,8 +221,10 @@ def get_ffmpeg_encoders():
     Returns empty set on error.
     """
     try:
-        command = ["ffmpeg", "-hide_banner", "-encoders"]
-        res = run_cmd(command)
+        cmd = ["ffmpeg", "-hide_banner", "-encoders"]
+        res = run_cmd(
+            cmd=cmd, dry_run=False  # always run encoders check, even in dry-run mode
+        )
         if res.returncode != 0:
             return set()
         enc = set()
@@ -156,8 +241,10 @@ def get_ffmpeg_encoders():
 def get_ffmpeg_decoders():
     """Return a set of decoder names reported by `ffmpeg -decoders`. Returns empty set on error."""
     try:
-        command = ["ffmpeg", "-hide_banner", "-decoders"]
-        res = run_cmd(command)
+        cmd = ["ffmpeg", "-hide_banner", "-decoders"]
+        res = run_cmd(
+            cmd=cmd, dry_run=False  # always run decoders check, even in dry-run mode
+        )
         if res.returncode != 0:
             return set()
         dec = set()
@@ -170,139 +257,106 @@ def get_ffmpeg_decoders():
         return set()
 
 
-def choose_best_hw_encoder(preferred: str):
+def choose_best_hw_encoder(preferred_codec: str) -> tuple[str, bool]:
     """Given preferred codec ('h264' or 'h265'/'hevc'), return (encoder_name, hwaccel_or_None).
 
     Returns (None, None) if no suitable hardware encoder found.
     """
-    pref = preferred.lower()
-    if pref == "hevc":
-        pref = "h265"
+    pref = preferred_codec.lower()
     # candidate lists ordered by preference
-    candidates = []
-    if pref.startswith("h264"):
-        candidates = [
-            ("h264_nvenc", None),
-            ("h264_qsv", "qsv"),
-            ("h264_d3d11va", "d3d11va"),
-            ("h264_dxva2", "dxva2"),
-            ("h264_videotoolbox", "videotoolbox"),
-        ]
-    else:
-        # assume h265
-        candidates = [
-            ("hevc_nvenc", None),
-            ("hevc_qsv", "qsv"),
-            ("hevc_d3d11va", "d3d11va"),
-            ("hevc_dxva2", "dxva2"),
-            ("hevc_videotoolbox", "videotoolbox"),
-        ]
 
     encoders = get_ffmpeg_encoders()
     hwaccels = get_ffmpeg_hwaccels()
 
-    def nvenc_available():
-        # try to find and load libcuda (libcuda.so.1?)
-        try:
-            lib = ctypes.util.find_library("cuda")
-            if lib:
-                ctypes.CDLL(lib)
-                return True
-            # try common soname
-            ctypes.CDLL("libcuda.so.1")
-            return True
-        except Exception:
-            # log debug detail about why libcuda couldn't be loaded
-            LOG.debug("nvenc runtime check: libcuda not loadable, will skip nvenc")
-            return False
-
-    have_nvenc = nvenc_available()
-
-    for name, hw in candidates:
-        if name in encoders:
-            # skip nvenc if CUDA / libcuda not available at runtime
-            if "nvenc" in name and not have_nvenc:
-                LOG.info(
-                    "Found %s encoder but libcuda not available at runtime, skipping nvenc",
-                    name,
-                )
-                continue
-            # if encoder requires a hwaccel, ensure it's present (nvenc typically doesn't need -hwaccel)
-            if hw and hw not in hwaccels:
-                continue
-            return name, hw
+    if pref == "h264":
+        for hw in hwaccels:
+            for enc in encoders:
+                el = enc.lower()
+                if hw in el and pref in el:
+                    return el, True
+        for enc in encoders:
+            if pref in enc.lower():
+                return enc, False
+    if pref in ("h265", "hevc"):
+        for hw in hwaccels:
+            for enc in encoders:
+                el = enc.lower()
+                if hw in el and ("h265" in el or "hevc" in el):
+                    return el, True
+        for enc in encoders:
+            el = enc.lower()
+            if "h265" in el or "hevc" in el:
+                return enc, False
     return None, None
 
 
-def nvenc_runtime_available():
-    """Return True if libcuda appears loadable at runtime, False otherwise."""
+def supports_10bit_hw(encoder_name: str) -> bool:
+    """Return True if ffmpeg accepts encoding with the given encoder name and 10-bit pixel format.
+
+    This runs a very short ffmpeg lavfi test encode using `-pix_fmt yuv420p10le` and checks the returncode.
+    It's a heuristic — some encoders may accept the flag but still downcast; this checks whether ffmpeg
+    accepts the combination without immediate error.
+    """
     try:
-        lib = ctypes.util.find_library("cuda")
-        if lib:
-            ctypes.CDLL(lib)
-            return True
-        ctypes.CDLL("libcuda.so.1")
-        return True
+        if not encoder_name:
+            return False
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=0.1:size=1280x720:rate=1",
+            "-c:v",
+            encoder_name,
+            "-pix_fmt",
+            "yuv420p10le",
+            "-t",
+            "0.1",
+            "-f",
+            "null",
+            "-",
+        ]
+        res = run_cmd(cmd=cmd, dry_run=False)
+        return res.returncode == 0
     except Exception:
         return False
 
 
-def get_software_vcodec_name(codec_hint: str) -> str:
-    """Return the software encoder token for a codec hint (h264/h265/hevc).
-
-    Examples: 'h264' -> 'libx264', 'h265'|'hevc' -> 'libx265'
-    """
-    if not codec_hint:
-        return "libx264"
-    hint = str(codec_hint).lower()
-    if "265" in hint or "hevc" in hint:
-        return "libx265"
-    return "libx264"
-
-
-def select_encoder_settings(args, mode: str) -> str:
+def select_encoder_settings(args: argparse.Namespace) -> str:
     """Centralize encoder selection decisions.
 
     Returns encoder
 
-    - For CRF mode: returns a software `libx264`/`libx265` token.
-    - For hardware mode: returns `args.codec` as the encoder token.
-
     Raises RuntimeError on unrecoverable selection failures (missing encoders).
     """
-    mode = (mode or "").lower()
-    if mode == "crf":
-        # prefer the requested software encoder but fall back to libx264 if missing
-        req_enc = f"lib{str(getattr(args, 'codec', '')).replace('h', 'x')}"
-        available_encs = get_ffmpeg_encoders()
-        if req_enc not in available_encs:
-            LOG.warning(
-                f"{req_enc} requested but not present in ffmpeg build, falling back to libx264...",
-            )
-            req_enc = "libx264"
-            if req_enc not in available_encs:
-                raise RuntimeError(
-                    f"Neither libx265 nor libx264 available in ffmpeg encoders: {', '.join(sorted(list(available_encs))[:40]) or '<none>'}"
-                )
-        return req_enc
-
-    # hardware or bitrate-driven mode
-    enc = getattr(args, "codec", None)
-    if not enc:
-        # default to codec hint
-        enc = "h264"
-
-    # otherwise target a bitrate
-    return enc
+    # prefer the requested software encoder
+    req_enc = getattr(args, "codec", None)
+    available_encs = get_ffmpeg_encoders()
+    if req_enc not in available_encs:
+        raise RuntimeError(
+            f"{req_enc} requested but not present in list of available encoders: {', '.join(sorted(list(available_encs))[:40]) or '<none>'}"
+        )
+    return req_enc
 
 
-def run_cmd(cmd):
+def run_cmd(cmd: list, dry_run: bool = False) -> subprocess.CompletedProcess:
+    """Run an external command and return a CompletedProcess.
+
+    If `args` is provided and `getattr(args, 'dry_run', False)` is True,
+    the command will not be executed; instead a fake successful
+    CompletedProcess with empty stdout/stderr is returned.
+    """
     LOG.info(f"Running command: {format_cmd_for_logging(cmd)}")
+    if dry_run:
+        # In dry-run mode, don't execute external commands; return a fake success.
+        LOG.debug("Dry-run: skipping execution of external command.")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return res
 
 
-def ffprobe_json(path):
+def ffprobe_json(path, args=None):
     cmd = [
         "ffprobe",
         "-v",
@@ -313,14 +367,17 @@ def ffprobe_json(path):
         "-show_streams",
         str(path),
     ]
-    res = run_cmd(cmd)
-    if res.returncode != 0:
+    res = run_cmd(
+        cmd=cmd,
+        dry_run=False,  # always run ffprobe, even in dry-run mode
+    )
+    if res.returncode != 0 or not res.stdout:
         raise RuntimeError(f"ffprobe failed: {res.stderr.strip()}")
     return json.loads(res.stdout)
 
 
-def compute_bitrate_and_duration(path):
-    info = ffprobe_json(path)
+def compute_bitrate_and_duration(path, args=None):
+    info = ffprobe_json(path, args=args)
     duration = float(info.get("format", {}).get("duration") or 0.0)
     # prefer first video stream bit_rate
     bitrate = None
@@ -354,64 +411,14 @@ def build_common_base(inp, hardware_accel=None, error_level="error"):
     return base
 
 
-def build_reencode_cmd_for_concat(concat_path: str, out_path: Path, args) -> list:
-    """Build an ffmpeg command to re-encode a concat list using project defaults.
-
-    This reuses the project's default decisions where possible: CRF mapping via
-    `map_quality_to_crf()`, `--threads`, audio handling (`--copy-audio`),
-    `--max-width`/`--max-height` scaling, pixel format and container flags.
-    """
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        args.log_level.lower(),
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        concat_path,
-    ]
-
-    # Use centralized encoder selection for CRF (software) mode
-    try:
-        vcodec = select_encoder_settings(args, mode="crf")
-        crf_val = map_quality_to_crf(getattr(args, "quality", None))
-    except RuntimeError as e:
-        LOG.error(str(e))
-        LOG.error("no suitable software encoder found. Aborting.")
-        return []
-
-    # Reuse the shared tail builder so container flags, audio handling,
-    # scaling, threads and progress behavior remain consistent.
-    tail_kwargs = {
-        "has_video": True,
-        "has_audio": True,
-        "vcodec": vcodec,
-        "out_path": out_path,
-        "preset": "veryslow",
-    }
-    if crf_val is not None:
-        tail_kwargs["crf"] = crf_val
-
-    tail = build_encode_tail(
-        args,
-        **tail_kwargs,
-    )
-
-    cmd += tail
-    return cmd
-
-
 def build_encode_tail(
     args,
     has_video: bool,
     has_audio: bool,
     *,
     vcodec=None,
-    crf=None,
+    quality=None,
+    mode=None,
     bitrate_kbps=None,
     tmp_path=None,
     chunking=False,
@@ -437,13 +444,19 @@ def build_encode_tail(
 
     # Video encoding selection - rely on caller-provided tokens/values
     if has_video:
-        if crf is not None and vcodec is not None:
-            preset_val = preset or "veryslow"
-            tail += ["-c:v", vcodec, "-preset", preset_val, "-crf", str(crf)]
-        elif bitrate_kbps is not None and vcodec is not None:
-            tail += ["-c:v", vcodec, "-b:v", f"{int(bitrate_kbps)}k"]
-        elif vcodec is not None:
+        if vcodec is not None:
             tail += ["-c:v", vcodec]
+        if mode == "crf":
+            if quality is not None:
+                preset_val = preset or "veryslow"
+                tail += ["-preset", preset_val, "-crf", map_quality_to_crf(quality)]
+            elif bitrate_kbps is not None:
+                tail += ["-b:v", f"{int(bitrate_kbps)}k"]
+        else:
+            if bitrate_kbps is not None:
+                tail += ["-b:v", f"{int(bitrate_kbps)}k", "-constant_bit_rate", "1"]
+            if quality is not None:
+                tail += ["-q:v", str(int(quality))]
 
     # threads
     if getattr(args, "threads", None) is not None:
@@ -469,11 +482,32 @@ def build_encode_tail(
         else:
             tail += ["-c:a", "aac", "-b:a", "128k"]
 
-    tail += ["-pix_fmt", "yuv420p"]
+    # honor requested bit depth (8 or 10). Default comes from USER_CONFIG.
+    try:
+        bit_depth = int(getattr(args, "bit", USER_CONFIG.get("default_bit_depth", 10)))
+    except Exception:
+        bit_depth = int(USER_CONFIG.get("default_bit_depth", 10))
+
+    pix = "yuv420p10le" if bit_depth == 10 else "yuv420p"
+    tail += ["-pix_fmt", pix]
+
+    # If 10-bit requested and output codec is HEVC/x265, add profile hints
+    vcodec_l = (vcodec or "").lower() if vcodec is not None else ""
+    if bit_depth == 10 and vcodec_l:
+        if "hvec_videotoolbox" in vcodec_l:
+            tail += ["-profile", "2"]
+        elif "libx265" in vcodec_l or "x265" in vcodec_l:
+            tail += ["-x265-params", "profile=main10"]
+        elif "hevc" in vcodec_l or "h265" in vcodec_l:
+            tail += ["-profile:v", "main10"]
 
     # container flags for mp4/mov
     if getattr(args, "suffix", None) in ("mp4", "mov"):
         tail += ["-movflags", "+faststart"]
+
+    # tags
+    if "hvec_videotoolbox" in vcodec_l:
+        tail += ["-tag:v", "hvc1"]
 
     # progress reporting
     tail += ["-progress", "pipe:1", "-nostats"]
@@ -626,7 +660,7 @@ def map_quality_to_crf(q):
     return max(0, min(51, crf))
 
 
-def run_ffmpeg_with_progress(cmd, total_duration=None):
+def run_ffmpeg_with_progress(cmd: list, total_duration: float = None) -> tuple:
     """
     Run ffmpeg with '-progress pipe:1 -nostats' already present in cmd.
     Streams stdout, parses 'out_time' progress keys, and computes speed = out_time_secs / elapsed_secs.
@@ -815,7 +849,6 @@ def encode_and_handle_output(
     args,
     tmp_path=None,
     tmp_dir=None,
-    tmp_pattern=None,
     chunking=False,
     total_duration=None,
     orig_size=None,
@@ -895,7 +928,12 @@ def process_concat_list(concat_path: str, inputs: list, args):
     """
     try:
         # Determine output directory and name
-        if getattr(args, "output", None):
+        # Respect normalized args.output_file / args.output_is_dir added in arg_parse
+        if getattr(args, "output_file", None):
+            out = Path(args.output_file)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out_dir = out.parent
+        elif getattr(args, "output_is_dir", False):
             out_dir = Path(args.output)
             out_dir.mkdir(parents=True, exist_ok=True)
             out = out_dir / ("joined." + args.suffix)
@@ -942,11 +980,9 @@ def process_concat_list(concat_path: str, inputs: list, args):
 
         # choose codec options using centralized selection
         vcodec = None
-        crf_val = None
         bitrate_kbps = None
         try:
-            vcodec = select_encoder_settings(args, mode=args.mode)
-            crf_val = map_quality_to_crf(getattr(args, "quality", None))
+            vcodec = select_encoder_settings(args)
         except RuntimeError as e:
             LOG.error(str(e))
             LOG.error("no suitable encoder found for concat-encode. Aborting.")
@@ -956,14 +992,15 @@ def process_concat_list(concat_path: str, inputs: list, args):
             "has_video": True,
             "has_audio": True,
             "vcodec": vcodec,
+            "mode": args.mode,
             "bitrate_kbps": bitrate_kbps,
             "tmp_path": tmp_path,
             "chunking": chunking,
             "tmp_pattern": tmp_pattern,
             "out_path": out,
         }
-        if crf_val is not None:
-            tail_kwargs["crf"] = crf_val
+        if getattr(args, "quality", None) is not None:
+            tail_kwargs["quality"] = getattr(args, "quality")
 
         tail = build_encode_tail(args, **tail_kwargs)
 
@@ -980,7 +1017,7 @@ def process_concat_list(concat_path: str, inputs: list, args):
         try:
             for f in inputs:
                 try:
-                    _, d, _, _ = compute_bitrate_and_duration(f)
+                    _, d, _, _ = compute_bitrate_and_duration(f, args)
                     total_duration += float(d or 0.0)
                 except Exception:
                     # ignore individual probe failures
@@ -1001,14 +1038,13 @@ def process_concat_list(concat_path: str, inputs: list, args):
         except Exception:
             orig_size = None
 
-        success, speed, elapsed_sec, final_out_time = encode_and_handle_output(
+        success, _, _, _ = encode_and_handle_output(
             cmd,
             out,
             inputs,
             args,
             tmp_path=tmp_path,
             tmp_dir=tmp_dir,
-            tmp_pattern=tmp_pattern,
             chunking=chunking,
             total_duration=total_duration,
             orig_size=orig_size,
@@ -1072,8 +1108,14 @@ def process_file(path, args):
         orig_size = inp.stat().st_size
     except Exception:
         orig_size = None
-    # determine output path: if args.output is set and is a directory, place file there
-    if getattr(args, "output", None):
+    # determine output path. Support three modes:
+    # - args.output_file: explicit single-file target (set in arg_parse)
+    # - args.output_is_dir: explicit output directory
+    # - default: same directory as input, with suffix
+    if getattr(args, "output_file", None):
+        out = Path(args.output_file)
+        out.parent.mkdir(parents=True, exist_ok=True)
+    elif getattr(args, "output_is_dir", False):
         out_dir = Path(args.output)
         out_dir.mkdir(parents=True, exist_ok=True)
         out = out_dir / inp.with_suffix(f".{args.suffix}").name
@@ -1082,7 +1124,7 @@ def process_file(path, args):
     try:
         # If the output exists and overwrite not requested, normally skip.
         # However, when the output path is the same file as the input (this
-        # happens during the quick-join flow where we concat to a temporary
+        # happens during the join flow where we concat to a temporary
         # joined file then process that same path), we should not skip.
         if out.exists() and not args.overwrite:
             try:
@@ -1094,6 +1136,7 @@ def process_file(path, args):
                         f"{out.name} exists, skipping... (use --overwrite to replace)"
                     )
                     return
+
             except Exception:
                 # If resolve() fails for any reason, fall back to conservative skip
                 LOG.warning(
@@ -1104,7 +1147,7 @@ def process_file(path, args):
         # If any filesystem check fails, continue and let later operations surface errors
         pass
 
-    bitrate, duration, probe, bitrate_source = compute_bitrate_and_duration(inp)
+    bitrate, duration, probe, bitrate_source = compute_bitrate_and_duration(inp, args)
     if bitrate is None:
         LOG.error(
             f"{inp.name}: ffprobe did not provide a source bitrate. Please re-run with --min-kbps and/or --max-kbps set to explicit values or check the ffprobe output."
@@ -1162,14 +1205,22 @@ def process_file(path, args):
             f_in = _parse_rational(
                 video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate")
             )
-            f_out = f_in
+            # Simple FPS-aware adjustment: pull baseline from config. Higher
+            # source framerates will proportionally increase target bitrate
+            # to preserve per-frame quality. This is a lightweight heuristic
+            # rather than a full motion analysis.
+            fps_baseline = float(getattr(args, "fps_baseline", 30.0))
+            try:
+                fps_multiplier = (
+                    (float(f_in) / fps_baseline) if f_in and fps_baseline > 0 else 1.0
+                )
+            except Exception:
+                fps_multiplier = 1.0
 
             spatial_exp = 0.9
             temporal_exp = 1.0
 
-            scale_multiplier = (r_spatial**spatial_exp) * (
-                (f_out / f_in) ** temporal_exp if f_in and f_out else 1.0
-            )
+            scale_multiplier = (r_spatial**spatial_exp) * (fps_multiplier**temporal_exp)
 
     except Exception:
         scale_multiplier = 1.0
@@ -1226,6 +1277,93 @@ def process_file(path, args):
         source_kbps,
         target_kbps,
     )
+
+    # During dry-run, provide a common-sense judgement about whether the
+    # target bitrate is high/standard/low for the video's resolution,
+    # motion multiplier and codec. Keep this lightweight and non-fatal.
+    if getattr(args, "dry_run", False):
+        try:
+            # find first video stream for resolution/codec hints
+            vid_stream = None
+            for s in probe.get("streams", []):
+                if s.get("codec_type") == "video":
+                    vid_stream = s
+                    break
+
+            width = int(vid_stream.get("width") or 0) if vid_stream else 0
+            height = int(vid_stream.get("height") or 0) if vid_stream else 0
+            codec_name = (
+                vid_stream.get("codec_name")
+                if vid_stream and vid_stream.get("codec_name")
+                else (getattr(args, "codec", None) or "unknown")
+            )
+
+            # resolution category factors (relative to a baseline 1080p expectation)
+            if width >= 3840 or height >= 2160:
+                res_factor = float(USER_CONFIG.get("res_factor_4k", 1.8))
+                res_label = "4k"
+            elif width >= 1920 or height >= 1080:
+                res_factor = float(USER_CONFIG.get("res_factor_1080p", 1.0))
+                res_label = "1080p"
+            elif width >= 1280 or height >= 720:
+                res_factor = float(USER_CONFIG.get("res_factor_720p", 0.6))
+                res_label = "720p"
+            else:
+                res_factor = float(USER_CONFIG.get("res_factor_sd", 0.35))
+                res_label = "SD"
+
+            # baseline for 1080p in kbps comes from configuration
+            baseline_1080p_kbps = float(USER_CONFIG.get("baseline_1080p_kbps", 8000.0))
+
+            expected_kbps = baseline_1080p_kbps * res_factor
+
+            # codec advantage: HEVC typically needs less bitrate for similar quality
+            hevc_mult = float(USER_CONFIG.get("hevc_multiplier", 0.7))
+            if codec_name and (
+                "265" in str(codec_name).lower() or "hevc" in str(codec_name).lower()
+            ):
+                expected_kbps *= hevc_mult
+
+            # incorporate motion multiplier if available (fall back to 1.0)
+            mm = (
+                float(motion_mult)
+                if ("motion_mult" in locals() and motion_mult is not None)
+                else float(getattr(args, "motion_multiplier", 1.0) or 1.0)
+            )
+            expected_kbps *= mm
+
+            # Decide label with configurable hysteresis thresholds
+            upper = float(USER_CONFIG.get("judgement_upper", 1.15))
+            lower = float(USER_CONFIG.get("judgement_lower", 0.85))
+            if target_kbps >= expected_kbps * upper:
+                level = "high"
+            elif target_kbps <= expected_kbps * lower:
+                level = "low"
+            else:
+                level = "standard"
+
+            LOG.info(
+                "This is %s for the motion multiplier of %.2f based on the resolution %dx%d (%s) and the %s codec",
+                level,
+                mm,
+                width,
+                height,
+                res_label,
+                codec_name,
+            )
+            try:
+                suggested_kbps = int(round(expected_kbps))
+                LOG.info(
+                    "Suggested target bitrate: %d kbps (heuristic for %s, motion_mult=%.2f)",
+                    suggested_kbps,
+                    res_label,
+                    mm,
+                )
+            except Exception:
+                LOG.debug("Failed to compute suggested bitrate", exc_info=True)
+        except Exception:
+            # Never fail the run due to the judgement helper
+            LOG.debug("Failed to compute bitrate judgement", exc_info=True)
 
     # Inspect streams
     streams = probe.get("streams", [])
@@ -1312,15 +1450,14 @@ def process_file(path, args):
         # duplicated flags here.
         # Determine codec/bitrate decisions and let shared tail append the remaining flags
         tail_vcodec = None
-        tail_crf = None
         tail_bitrate = None
         tail_preset = None
 
         # Centralized encoder selection
         try:
-            sel_vcodec = select_encoder_settings(args, mode=args.mode)
+            sel_vcodec = select_encoder_settings(args)
             sel_bitrate = target_kbps
-            sel_quality = map_quality_to_crf(getattr(args, "quality", None))
+
         except RuntimeError as e:
             LOG.error(str(e))
             try:
@@ -1333,28 +1470,31 @@ def process_file(path, args):
         if args.mode == "crf":
             # software encoder token and CRF mapped
             tail_vcodec = sel_vcodec
-            tail_crf = sel_quality
             tail_preset = "veryslow"
+            tail_crf = map_quality_to_crf(args.quality)
             LOG.info("Using CRF=%s (mapped from quality=%s)", tail_crf, args.quality)
         else:
             # hardware or bitrate-based mode: prefer bitrate targeting
             tail_vcodec = sel_vcodec or args.codec
             tail_bitrate = sel_bitrate
 
-        # Build shared tail and append
-        tail = build_encode_tail(
-            args,
-            has_video=has_video,
-            has_audio=has_audio,
-            vcodec=tail_vcodec,
-            crf=tail_crf,
-            bitrate_kbps=tail_bitrate,
-            tmp_path=tmp_path,
-            chunking=chunking,
-            tmp_pattern=tmp_pattern,
-            out_path=out,
-            preset=tail_preset,
-        )
+        tail_kwargs = {
+            "has_video": has_video,
+            "has_audio": has_audio,
+            "vcodec": tail_vcodec,
+            "quality": getattr(args, "quality", None),
+            "bitrate_kbps": tail_bitrate,
+            "tmp_path": tmp_path,
+            "chunking": chunking,
+            "tmp_pattern": tmp_pattern,
+            "out_path": out,
+            "preset": tail_preset,
+        }
+
+        if getattr(args, "quality", None) is not None:
+            tail_kwargs["quality"] = getattr(args, "quality")
+
+        tail = build_encode_tail(args, **tail_kwargs)
 
         cmd += tail
 
@@ -1365,7 +1505,6 @@ def process_file(path, args):
             args,
             tmp_path=tmp_path,
             tmp_dir=tmp_dir,
-            tmp_pattern=tmp_pattern,
             chunking=chunking,
             total_duration=duration,
             orig_size=orig_size,
@@ -1407,20 +1546,6 @@ def process_file(path, args):
 def main(argv):
     args = arg_parse(argv)
 
-    # Normalize encoder synonyms to canonical 'h264'/'h265'
-    if args.codec:
-        enc_map = {
-            "size": "h265",
-            "compatibility": "h264",
-            "avc": "h264",
-            "x264": "h264",
-            "h264": "h264",
-            "hevc": "h265",
-            "x265": "h265",
-            "h265": "h265",
-        }
-        args.codec = enc_map.get(str(args.codec).lower(), args.codec)
-
     if args.mode == "software":
         args.mode = "crf"
 
@@ -1431,38 +1556,66 @@ def main(argv):
                     "Hardware mode on macOS detected — capping workers to 1 for VideoToolbox stability"
                 )
             args.workers = 1
+
+    # Normalize encoder synonyms to canonical 'h264'/'h265'
+    if args.codec:
+        enc_map = {
+            "software": {
+                "size": "h265",
+                "compatibility": "h264",
+                "avc": "h264",
+                "x264": "h264",
+                "h264": "h264",
+                "hevc": "h265",
+                "x265": "h265",
+                "h265": "h265",
+            },
+            "hardware": {
+                "size": "h265",
+                "compatibility": "h264",
+                "avc": "h264",
+                "h264": "h264",
+                "h265": "h265",
+            },
+        }
+        args.codec = enc_map.get(str(args.codec).lower(), args.codec)
     if args.mode == "hardware" and args.codec == "h265":
         args.codec = "hevc"  # ffmpeg uses 'hevc' for h265 when using hwaccel
+
     # If hardware mode requested, attempt to pick a suitable hw encoder if available
     if args.mode == "hardware":
         # try to auto-select best available hw encoder
         # If a user forced an exact encoder token, validate and use it
-        if getattr(args, "force_encoder", None):
-            forced = args.force_encoder
+        if getattr(args, "encoder", None):
             encs = get_ffmpeg_encoders()
-            if forced not in encs:
+            if args.encoder not in encs:
                 LOG.error(
-                    f"Requested forced encoder {forced} not available in this ffmpeg build."
+                    f"Requested encoder {args.encoder} not available in this ffmpeg build."
                 )
                 LOG.error(
                     f"Available encoders: {', '.join(sorted(list(encs))[:40]) or '<none>'}"
                 )
                 sys.exit(1)
-            # if forcing nvenc, ensure runtime libcuda is present
-            if "nvenc" in forced and not nvenc_runtime_available():
-                LOG.error(
-                    f"Forced encoder {forced} requires NVENC but libcuda cannot be loaded at runtime. Aborting."
-                )
-                sys.exit(1)
-            LOG.info(f"Using forced hardware encoder {forced}.")
-            args.codec = forced
+            LOG.info(f"Using encoder {args.encoder}.")
+            args.codec = args.encoder
             # try to infer a hwaccel from encoder token
-            if "qsv" in forced:
+            if "qsv" in args.encoder:
                 setattr(args, "_hwaccel", "qsv")
-            elif "videotoolbox" in forced:
+            elif "videotoolbox" in args.encoder:
                 setattr(args, "_hwaccel", "videotoolbox")
-            elif "vaapi" in forced:
+            elif "vaapi" in args.encoder:
                 setattr(args, "_hwaccel", "vaapi")
+            # If user requested 10-bit output, probe whether this encoder accepts 10-bit
+            try:
+                if getattr(args, "bit", USER_CONFIG.get("default_bit_depth", 10)) == 10:
+                    if not supports_10bit_hw(args.codec):
+                        LOG.warning(
+                            "Requested 10-bit output but hardware encoder %s does not appear to support 10-bit; falling back to 8-bit.",
+                            args.codec,
+                        )
+                        args.bit = 8
+            except Exception:
+                pass
         else:
             chosen, hwaccel = choose_best_hw_encoder(args.codec)
             if chosen:
@@ -1471,6 +1624,20 @@ def main(argv):
                 )
                 args.codec = chosen
                 setattr(args, "_hwaccel", hwaccel)
+                # If user requested 10-bit output, probe whether this encoder accepts 10-bit
+                try:
+                    if (
+                        getattr(args, "bit", USER_CONFIG.get("default_bit_depth", 10))
+                        == 10
+                    ):
+                        if not supports_10bit_hw(args.codec):
+                            LOG.warning(
+                                "Requested 10-bit output but auto-selected hardware encoder %s does not appear to support 10-bit; falling back to 8-bit.",
+                                args.codec,
+                            )
+                            args.bit = 8
+                except Exception:
+                    pass
             else:
                 LOG.error(
                     "No suitable hardware encoder found. Aborting. Run with --mode crf for software encoding or --force-encoder to pick one."
@@ -1519,25 +1686,84 @@ def main(argv):
     setup_logging()
     LOG.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
 
-    ensure_ffmpeg_available(getattr(args, "dry_run", False))
+    ensure_ffmpeg_available()
 
-    files = args.files
+    # Expand inputs: support globbing, directories and recursive search filtered by extensions
+    exts_raw = getattr(args, "extensions", None)
+    if exts_raw:
+        exts = set(
+            "." + e.strip().lstrip(".").lower()
+            for e in exts_raw.split(",")
+            if e.strip()
+        )
+    else:
+        exts = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".ts"}
+
+    files = []
+    for entry in args.files:
+        # expand shell-style globs if present
+        if any(ch in entry for ch in ["*", "?", "["]):
+            matches = glob.glob(entry, recursive=True)
+            matches.sort()
+            for m in matches:
+                p = Path(m)
+                if p.is_dir():
+                    if args.recursive:
+                        for pp in p.rglob("*"):
+                            if pp.is_file() and pp.suffix.lower() in exts:
+                                files.append(str(pp))
+                else:
+                    if p.suffix.lower() in exts:
+                        files.append(str(p))
+            continue
+
+        p = Path(entry)
+        if p.exists():
+            if p.is_dir():
+                if args.recursive:
+                    for pp in p.rglob("*"):
+                        if pp.is_file() and pp.suffix.lower() in exts:
+                            files.append(str(pp))
+                else:
+                    LOG.warning(
+                        "Directory passed without --recursive, skipping: %s", entry
+                    )
+            elif p.is_file():
+                if p.suffix.lower() in exts or not args.recursive:
+                    files.append(str(p))
+        else:
+            LOG.warning("Input path does not exist: %s", entry)
+
+    # deduplicate while preserving order. Resolve paths (non-strict) first so
+    # different textual forms (./x.mp4, ../dir/x.mp4, /abs/path/x.mp4) collapse.
+    seen = set()
+    unique_files = []
+    for f in files:
+        try:
+            rf = str(Path(f).resolve(strict=False))
+        except Exception:
+            rf = os.path.abspath(f)
+        if rf not in seen:
+            seen.add(rf)
+            unique_files.append(rf)
+    files = unique_files
+
+    if not files:
+        LOG.error("No input files found after expanding inputs. Exiting.")
+        sys.exit(1)
+
     quick_joined_path = None
     quick_join_orig_files = None
-    # When True we will remove the quick-joined intermediate on exit
-    # Set to True when quick-join is created as an internal intermediate that will
-    # be processed. If the quick-joined file is intended as final output we
-    # set this to False to preserve it.
     quick_join_delete_on_exit = False
 
-    # Handle --quick_join: concatenate all inputs into a single temp file first
-    if getattr(args, "quick_join", False):
+    # Handle --join: concatenate all inputs into a single temp file first
+    if getattr(args, "join", False):
         if len(files) < 2:
             LOG.warning(
-                "--quick-join requires at least 2 input files, processing normally..."
+                "--join requires at least 2 input files, processing normally..."
             )
         else:
-            LOG.info(f"Quick-joining {len(files)} input files into a single video...")
+            LOG.info(f"Joining {len(files)} input files into a single video...")
             # Create a temporary concat file
             concat_path = None
             joined_tmp = None
@@ -1579,16 +1805,20 @@ def main(argv):
                             cf.write(f"file '{ap}'\n")
 
                 # Determine output name for joined file
-                if getattr(args, "output", None):
+                if getattr(args, "output_file", None):
+                    joined_path = Path(args.output_file)
+                    out_dir = joined_path.parent
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                elif getattr(args, "output_is_dir", False):
                     out_dir = Path(args.output)
                     out_dir.mkdir(parents=True, exist_ok=True)
                     joined_name = "joined" + "." + args.suffix
+                    joined_path = out_dir / joined_name
                 else:
                     # Use parent of first input file
                     out_dir = Path(files[0]).parent
                     joined_name = "joined" + "." + args.suffix
-
-                joined_path = out_dir / joined_name
+                    joined_path = out_dir / joined_name
 
                 # Create temp file for joined output
                 with tempfile.NamedTemporaryFile(
@@ -1607,7 +1837,9 @@ def main(argv):
                     try:
                         for f in quick_join_orig_files:
                             try:
-                                _, dur, _, _ = compute_bitrate_and_duration(Path(f))
+                                _, dur, _, _ = compute_bitrate_and_duration(
+                                    Path(f), args
+                                )
                                 total_duration += float(dur or 0.0)
                             except Exception:
                                 LOG.debug(f"Could not determine duration for {f}")
@@ -1635,14 +1867,14 @@ def main(argv):
                         str(joined_tmp),
                     ]
 
-                    rc, _, stderr_text, speed, elapsed_sec, final_out_time = (
-                        run_ffmpeg_with_progress(
-                            concat_cmd, total_duration=total_duration
-                        )
+                    rc, _, stderr_text, _, _, _ = run_ffmpeg_with_progress(
+                        concat_cmd, total_duration=total_duration
                     )
 
                     if rc != 0:
-                        LOG.error("Copy-based concat failed, aborting quick-join...")
+                        LOG.error(
+                            "Copy-based concat failed, aborting join. You may want to try re-encoding the files first."
+                        )
                         LOG.debug(f"ffmpeg stderr:\n{stderr_text}")
                         try:
                             if joined_tmp and joined_tmp.exists():
@@ -1654,7 +1886,7 @@ def main(argv):
                     # Move to final location (respect --overwrite)
                     if joined_path.exists() and not args.overwrite:
                         LOG.error(
-                            f"{joined_path.name} exists and --overwrite not set. Aborting quick-join."
+                            f"{joined_path.name} exists and --overwrite not set. Aborting join."
                         )
                         try:
                             if joined_tmp and joined_tmp.exists():
@@ -1689,7 +1921,7 @@ def main(argv):
                     pass
 
     try:
-        if args.workers > 1 and not getattr(args, "join", False):
+        if args.workers > 1:
             with ThreadPoolExecutor(max_workers=args.workers) as ex:
                 futures = {ex.submit(process_file, f, args): f for f in files}
                 for fut in as_completed(futures):
@@ -1700,96 +1932,18 @@ def main(argv):
                             f"Exception processing [bold]{futures[fut]}[/bold]: {e}."
                         )
         else:
-            if getattr(args, "join", False):
-                # Create a temporary concat file
+            for f in files:
+                if getattr(args, "skip_processing", False):
+                    continue
                 try:
-                    # Try to place the concat list in the same directory as
-                    # the first input so it's easy to inspect while running.
-                    first_parent = Path(files[0]).parent
-                    first_parent.mkdir(parents=False, exist_ok=True)
-                    fd_path = first_parent / (
-                        "compress_buddy_concat_"
-                        + next(tempfile._get_candidate_names())
-                        + ".txt"
-                    )
-                    concat_fd = os.open(
-                        str(fd_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-                    )
-                    concat_path = str(fd_path)
-                except Exception:
-                    concat_fd, concat_path = tempfile.mkstemp(
-                        suffix=".txt", prefix="compress_buddy_concat_"
-                    )
-                try:
-                    LOG.info(f"Writing concat list to: {concat_path}")
-                    with os.fdopen(concat_fd, "w") as cf:
-                        for f in files:
-                            # ffmpeg concat demuxer requires absolute paths
-                            abs_path = Path(f).resolve()
-                            ap = str(abs_path)
-                            if "'" in ap:
-                                cf.write(f'file "{ap}"\n')
-                            else:
-                                cf.write(f"file '{ap}'\n")
-
-                    process_concat_list(concat_path, files, args)
-                finally:
-                    # Clean up concat file
-                    try:
-                        if concat_path:
-                            Path(concat_path).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-            else:
-                # If we created a quick-joined intermediate and the user did not
-                # request any additional processing flags, treat the quick-join
-                # as the final output and skip re-processing. This avoids
-                # re-encoding a file when the intent was only a copy-based join.
-                skip_processing = False
-                if quick_joined_path and quick_join_orig_files:
-                    # Detect a set of flags that imply further processing.
-                    extra_flags = any(
-                        (
-                            getattr(args, "max_width", None) is not None,
-                            getattr(args, "max_height", None) is not None,
-                            (int(getattr(args, "chunk_seconds", 0) or 0) > 0)
-                            or (getattr(args, "chunk_minutes", 0) > 0),
-                            getattr(args, "delete_original", False),
-                            getattr(args, "output", None) is not None,
-                            getattr(args, "overwrite", False),
-                            getattr(args, "motion_multiplier", None) is not None,
-                            getattr(args, "quality", None) is not None,
-                            getattr(args, "copy_audio", False),
-                            getattr(args, "mode", None) == "crf",
-                            getattr(args, "threads", None) is not None,
-                        )
-                    )
-                    # if any True then we should process
-                    if not any(extra_flags):
-                        LOG.info(
-                            "Quick-join completed and no processing flags provided, skipping re-encoding step."
-                        )
-                        skip_processing = True
-                        # Preserve the joined file as final output
-                        quick_join_delete_on_exit = False
-
-                for f in files:
-                    if (
-                        skip_processing
-                        and quick_joined_path
-                        and Path(f) == quick_joined_path
-                    ):
-                        # Skip processing the joined intermediate
-                        continue
-                    try:
-                        process_file(f, args)
-                    except Exception as e:
-                        LOG.error(f"Exception processing {f}: {e}.")
+                    process_file(f, args)
+                except Exception as e:
+                    LOG.error(f"Exception processing {f}: {e}.")
     except KeyboardInterrupt:
         LOG.error("\nKeyboard interrupt received, stopping program.")
         sys.exit(130)
     finally:
-        # Clean up quick-joined intermediate if created (it's an internal temp)
+        # Clean up joined intermediate if created (it's an internal temp)
         try:
             if (
                 quick_joined_path
@@ -1797,7 +1951,7 @@ def main(argv):
                 and quick_join_delete_on_exit
             ):
                 quick_joined_path.unlink(missing_ok=True)
-                LOG.info(f"Removed temporary quick-joined file: {quick_joined_path}")
+                LOG.info(f"Removed temporary joined file: {quick_joined_path}")
         except Exception:
             pass
 
@@ -1808,7 +1962,7 @@ def arg_parse(argv):
     p.add_argument(
         "--mode",
         choices=("hardware", "crf", "software"),
-        default="hardware",
+        default=None,
         help="encode mode",
     )
     p.add_argument(
@@ -1816,6 +1970,11 @@ def arg_parse(argv):
         type=int,
         default=None,
         help="Quality value, 0 being worst and 100 being best",
+    )
+    p.add_argument(
+        "--quality-demo",
+        action="store_true",
+        help="Create a demo video showing quality steps 0..100 split into 10 parts",
     )
     p.add_argument(
         "--codec",
@@ -1829,14 +1988,14 @@ def arg_parse(argv):
             "size",
             "compatibility",
         ),
-        default="h265",
+        default=None,
         help="codec to target (h264/avc/compatibility or h265/hevc/size). 'h264' for compatibility, 'h265' for better compression.",
     )
     p.add_argument(
-        "--force-encoder",
+        "--encoder",
         type=str,
         default=None,
-        help="Force exact ffmpeg encoder token to use (e.g. hevc_videotoolbox, h264_nvenc). Overrides auto-selection.",
+        help="Force exact ffmpeg encoder token to use.",
     )
     p.add_argument(
         "--min-kbps",
@@ -1853,8 +2012,8 @@ def arg_parse(argv):
     p.add_argument(
         "--target-factor",
         type=float,
-        default=0.7,
-        help="Fraction of source bitrate to target (0.0 < factor <= 1.0). Default 0.7",
+        default=None,  # Default loaded from USER_CONFIG in process_file
+        help="Fraction of source bitrate to target (0.0 < factor <= 1.0)",
     )
     p.add_argument(
         "--dry-run", action="store_true", help="show actions but don't run ffmpeg"
@@ -1888,9 +2047,21 @@ def arg_parse(argv):
         help="join all input videos into a single file before processing",
     )
     p.add_argument(
-        "--quick-join",
+        "--skip-processing",
         action="store_true",
-        help="Quickly join inputs with a copy-based concat (-c copy) and then process the result if other flags are provided.",
+        help="Skip processing of files (useful with --join to only join files)",
+    )
+    p.add_argument(
+        "--recursive",
+        "-r",
+        action="store_true",
+        help="Recurse into directories to find input files",
+    )
+    p.add_argument(
+        "--extensions",
+        type=str,
+        default="mp4,mov,mkv,webm,avi,m4v,mpg,mpeg,ts",
+        help="Comma-separated file extensions to include when recursing (no dots).",
     )
     p.add_argument(
         "--log-level",
@@ -1906,8 +2077,8 @@ def arg_parse(argv):
     p.add_argument(
         "--suffix",
         choices=("mp4", "mov", "mkv", "avi"),
-        default="mov",
-        help="output file suffix (default mov)",
+        default=None,
+        help="output file suffix (default in config)",
     )
     p.add_argument(
         "--max-width",
@@ -1944,10 +2115,54 @@ def arg_parse(argv):
         help="Specify motion multiplier. >1.0 increases bitrate for high-motion videos, <1.0 decreases for low-motion.",
     )
 
+    p.add_argument(
+        "--bit",
+        type=int,
+        choices=(8, 10),
+        default=None,
+        help="Output bit depth, 8 or 10. If omitted, defaults from config (default_bit_depth).",
+    )
+
     args = p.parse_args(argv)
+
+    # Set bit depth default from USER_CONFIG if not provided on CLI
+    try:
+        if getattr(args, "bit", None) is None:
+            args.bit = int(USER_CONFIG.get("default_bit_depth", 10))
+        if args.bit not in (8, 10):
+            raise ValueError("--bit must be 8 or 10")
+    except Exception:
+        p.error("--bit must be 8 or 10")
+
+    try:
+        if getattr(args, "mode", None) is None:
+            args.mode = str(USER_CONFIG.get("preferred_mode", "hardware")).lower()
+            if args.mode not in ("hardware", "crf", "software"):
+                raise ValueError()
+    except Exception:
+        p.error("Invalid default_mode in config, must be hardware, crf, or software")
+
+    try:
+        if getattr(args, "codec", None) is None:
+            args.codec = str(USER_CONFIG.get("preferred_codec", "size")).lower()
+            if args.codec not in (
+                "h264",
+                "h265",
+                "avc",
+                "hevc",
+                "x264",
+                "x265",
+                "size",
+                "compatibility",
+            ):
+                raise ValueError()
+    except Exception:
+        p.error("Invalid preferred_codec in config")
 
     # Validate target factor
     try:
+        if args.target_factor is None:
+            args.target_factor = float(USER_CONFIG.get("target_factor", 0.7))
         tf = float(args.target_factor)
         if not (0.0 < tf <= 1.0):
             raise ValueError()
@@ -1987,10 +2202,6 @@ def arg_parse(argv):
     if args.workers <= 0:
         p.error("--workers must be a positive integer")
 
-    # Prevent using both join modes simultaneously
-    if args.join and args.quick_join:
-        p.error("--join and --quick-join are mutually exclusive")
-
     if args.quality is not None:
         try:
             q = int(args.quality)
@@ -1998,6 +2209,57 @@ def arg_parse(argv):
                 p.error("--quality must be between 0 and 100")
         except Exception:
             p.error("Invalid --quality value")
+
+    # Pull default from config if suffix not provided
+    try:
+        if getattr(args, "suffix", None) is None:
+            args.suffix = str(USER_CONFIG.get("suffix", "mp4"))
+    except Exception:
+        args.suffix = USER_CONFIG.get("suffix", "mp4")
+
+    # Normalize and validate `--output` semantics:
+    # Rules implemented:
+    # 1) Trailing slash -> treat as directory
+    # 2) If an extension is present (Path.suffix) -> treat as a file
+    # 3) If an extension is provided and --suffix is provided, they must match
+    # 4) If no extension, no --suffix, and no trailing slash -> assume folder
+    if getattr(args, "output", None):
+        out_str = str(args.output)
+        is_trailing = out_str.endswith(os.sep) or out_str.endswith("/")
+        out_path = Path(out_str)
+        has_ext = bool(out_path.suffix)
+
+        if is_trailing:
+            # explicit directory
+            args.output_is_dir = True
+            # keep args.output as provided (string)
+        elif has_ext:
+            # explicit file
+            ext = out_path.suffix.lstrip(".").lower()
+            if getattr(args, "suffix", None) and ext != str(args.suffix).lower():
+                p.error(
+                    f"--output extension .{ext} conflicts with --suffix {args.suffix}"
+                )
+            args.output_file = str(out_path)
+            args.output_is_dir = False
+        else:
+            # no suffix in provided output
+            if getattr(args, "suffix", None):
+                # treat as a filename without extension: append suffix
+                out_with_ext = out_path.with_suffix("." + str(args.suffix))
+                args.output_file = str(out_with_ext)
+                args.output_is_dir = False
+            else:
+                # ambiguous: default to directory per rule (4)
+                args.output_is_dir = True
+
+    # If user provided multiple input files but specified a single output file
+    # (not a directory) and did not request a join, that's an error.
+    if getattr(args, "output_file", None) and len(getattr(args, "files", [])) > 1:
+        if not getattr(args, "join", False):
+            p.error(
+                "--output targets a single file but multiple input files were provided. Use --join or specify an output directory."
+            )
 
     return args
 

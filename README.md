@@ -273,6 +273,42 @@ python compress_buddy.py -o C:\tmp test.mp4
 - If you see errors about unknown encoders, try installing `ffmpeg-full`, install an ffmpeg build with the required encoders (e.g., `libx264`, `libx265`)
 - To get more visibility into ffmpeg progress and script decisions, run with `--log-level DEBUG` (it is very VERBOSE tho)
 
+**Configuration File**
+- **Locations searched (first found wins):**
+	- `./compress_buddy.ini` (script directory)
+	- `$XDG_CONFIG_HOME/compress_buddy/config.ini`
+	- `~/.config/compress_buddy/config.ini`
+	- `~/.compress_buddy.ini`
+- **How it works:** the tool reads a `[defaults]` section and applies values when CLI flags are not provided. This is useful to set your preferred encoder, output suffix, and other defaults so you don't need to pass them on every run.
+- **Common keys you can set:**
+	- `preferred_mode` — `hardware` or `crf` (software). If omitted the script defaults to `hardware`.
+	- `preferred_codec` — `h264` or `h265` (controls codec preference when not explicitly provided on the command-line).
+	- `default_bit_depth` — `8` or `10`.
+	- `suffix` — default output container (`mp4`, `mov`, etc.).
+	- `target_factor` — fraction of source bitrate used to compute target bitrate (default `0.7`).
+
+Edit `compress_buddy.ini` or one of the other config paths above to make these defaults persistent. Example `compress_buddy.ini` snippet:
+
+```ini
+[defaults]
+preferred_mode = hardware
+preferred_codec = h265
+default_bit_depth = 10
+suffix = mp4
+target_factor = 0.7
+```
+
+**Quality Demo Mode**
+- Use `--quality-demo` to create a single demo video that shows progressive quality steps. The tool will:
+	- split the input into 10 equal-duration segments,
+	- encode each segment at qualities `0, 10, 20, ..., 100` (mapped to CRF for software CRF mode, or to progressive target bitrates when `hardware` mode is used),
+	- overlay the quality label on each segment, and
+	- concatenate the segments into `INPUTNAME_quality_demo.<suffix>` in the output folder (or next to the input file if `--output` is not provided).
+- Example:
+
+```bash
+python3 compress_buddy.py --quality-demo -o /tmp/outdir myvideo.mp4
+```
 
 ## Limiting CPU usage and threads
 
