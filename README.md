@@ -273,7 +273,7 @@ python compress_buddy.py -o C:\tmp test.mp4
 - If you see errors about unknown encoders, try installing `ffmpeg-full`, install an ffmpeg build with the required encoders (e.g., `libx264`, `libx265`)
 - To get more visibility into ffmpeg progress and script decisions, run with `--log-level DEBUG` (it is very VERBOSE tho)
 
-**Configuration File**
+## Configuration File
 - **Locations searched (first found wins):**
 	- `./compress_buddy.ini` (script directory)
 	- `$XDG_CONFIG_HOME/compress_buddy/config.ini`
@@ -298,21 +298,9 @@ suffix = mp4
 target_factor = 0.7
 ```
 
-**Quality Demo Mode**
-- Use `--quality-demo` to create a single demo video that shows progressive quality steps. The tool will:
-	- split the input into 10 equal-duration segments,
-	- encode each segment at qualities `0, 10, 20, ..., 100` (mapped to CRF for software CRF mode, or to progressive target bitrates when `hardware` mode is used),
-	- overlay the quality label on each segment, and
-	- concatenate the segments into `INPUTNAME_quality_demo.<suffix>` in the output folder (or next to the input file if `--output` is not provided).
-- Example:
-
-```bash
-python3 compress_buddy.py --quality-demo -o /tmp/outdir myvideo.mp4
-```
-
 ## Limiting CPU usage and threads
 
-If an encode still uses too much CPU even with `--nice`, you can further limit ffmpeg:
+If an encode uses too much CPU you can limit ffmpeg:
 
 - `--threads N` passes `-threads N` to ffmpeg directly
 - If you run with `--workers > 1` and do not specify `--threads`, we will auto-calculate a `threads` value per worker by dividing the logical CPU count by the number of workers (minimum 1)
