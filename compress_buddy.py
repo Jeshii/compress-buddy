@@ -454,7 +454,9 @@ def build_encode_tail(
                 tail += ["-b:v", f"{int(bitrate_kbps)}k"]
         else:
             if bitrate_kbps is not None:
-                tail += ["-b:v", f"{int(bitrate_kbps)}k", "-constant_bit_rate", "1"]
+                tail += ["-b:v", f"{int(bitrate_kbps)}k"]
+                if "videotoolbox" in (vcodec or "").lower():
+                    tail += ["-constant_bit_rate", "1"]
             if quality is not None:
                 tail += ["-q:v", str(int(quality))]
 
@@ -1278,92 +1280,89 @@ def process_file(path, args):
         target_kbps,
     )
 
-    # During dry-run, provide a common-sense judgement about whether the
-    # target bitrate is high/standard/low for the video's resolution,
-    # motion multiplier and codec. Keep this lightweight and non-fatal.
-    if getattr(args, "dry_run", False):
+    # Bitrate quality suggestion
+    try:
+        # find first video stream for resolution/codec hints
+        vid_stream = None
+        for s in probe.get("streams", []):
+            if s.get("codec_type") == "video":
+                vid_stream = s
+                break
+
+        width = int(vid_stream.get("width") or 0) if vid_stream else 0
+        height = int(vid_stream.get("height") or 0) if vid_stream else 0
+        codec_name = (
+            vid_stream.get("codec_name")
+            if vid_stream and vid_stream.get("codec_name")
+            else (getattr(args, "codec", None) or "unknown")
+        )
+
+        # resolution category factors (relative to a baseline 1080p expectation)
+        if width >= 3840 or height >= 2160:
+            res_factor = float(USER_CONFIG.get("res_factor_4k", 1.8))
+            res_label = "4k"
+        elif width >= 1920 or height >= 1080:
+            res_factor = float(USER_CONFIG.get("res_factor_1080p", 1.0))
+            res_label = "1080p"
+        elif width >= 1280 or height >= 720:
+            res_factor = float(USER_CONFIG.get("res_factor_720p", 0.6))
+            res_label = "720p"
+        else:
+            res_factor = float(USER_CONFIG.get("res_factor_sd", 0.35))
+            res_label = "SD"
+
+        # baseline for 1080p in kbps comes from configuration
+        baseline_1080p_kbps = float(USER_CONFIG.get("baseline_1080p_kbps", 8000.0))
+
+        expected_kbps = baseline_1080p_kbps * res_factor
+
+        # codec advantage: HEVC typically needs less bitrate for similar quality
+        hevc_mult = float(USER_CONFIG.get("hevc_multiplier", 0.7))
+        if codec_name and (
+            "265" in str(codec_name).lower() or "hevc" in str(codec_name).lower()
+        ):
+            expected_kbps *= hevc_mult
+
+        # incorporate motion multiplier if available (fall back to 1.0)
+        mm = (
+            float(motion_mult)
+            if ("motion_mult" in locals() and motion_mult is not None)
+            else float(getattr(args, "motion_multiplier", 1.0) or 1.0)
+        )
+        expected_kbps *= mm
+
+        # Decide label with configurable hysteresis thresholds
+        upper = float(USER_CONFIG.get("judgement_upper", 1.15))
+        lower = float(USER_CONFIG.get("judgement_lower", 0.85))
+        if target_kbps >= expected_kbps * upper:
+            level = "high"
+        elif target_kbps <= expected_kbps * lower:
+            level = "low"
+        else:
+            level = "standard"
+
+        LOG.info(
+            "This is %s for the motion multiplier of %.2f based on the resolution %dx%d (%s) and the %s codec",
+            level,
+            mm,
+            width,
+            height,
+            res_label,
+            codec_name,
+        )
         try:
-            # find first video stream for resolution/codec hints
-            vid_stream = None
-            for s in probe.get("streams", []):
-                if s.get("codec_type") == "video":
-                    vid_stream = s
-                    break
-
-            width = int(vid_stream.get("width") or 0) if vid_stream else 0
-            height = int(vid_stream.get("height") or 0) if vid_stream else 0
-            codec_name = (
-                vid_stream.get("codec_name")
-                if vid_stream and vid_stream.get("codec_name")
-                else (getattr(args, "codec", None) or "unknown")
-            )
-
-            # resolution category factors (relative to a baseline 1080p expectation)
-            if width >= 3840 or height >= 2160:
-                res_factor = float(USER_CONFIG.get("res_factor_4k", 1.8))
-                res_label = "4k"
-            elif width >= 1920 or height >= 1080:
-                res_factor = float(USER_CONFIG.get("res_factor_1080p", 1.0))
-                res_label = "1080p"
-            elif width >= 1280 or height >= 720:
-                res_factor = float(USER_CONFIG.get("res_factor_720p", 0.6))
-                res_label = "720p"
-            else:
-                res_factor = float(USER_CONFIG.get("res_factor_sd", 0.35))
-                res_label = "SD"
-
-            # baseline for 1080p in kbps comes from configuration
-            baseline_1080p_kbps = float(USER_CONFIG.get("baseline_1080p_kbps", 8000.0))
-
-            expected_kbps = baseline_1080p_kbps * res_factor
-
-            # codec advantage: HEVC typically needs less bitrate for similar quality
-            hevc_mult = float(USER_CONFIG.get("hevc_multiplier", 0.7))
-            if codec_name and (
-                "265" in str(codec_name).lower() or "hevc" in str(codec_name).lower()
-            ):
-                expected_kbps *= hevc_mult
-
-            # incorporate motion multiplier if available (fall back to 1.0)
-            mm = (
-                float(motion_mult)
-                if ("motion_mult" in locals() and motion_mult is not None)
-                else float(getattr(args, "motion_multiplier", 1.0) or 1.0)
-            )
-            expected_kbps *= mm
-
-            # Decide label with configurable hysteresis thresholds
-            upper = float(USER_CONFIG.get("judgement_upper", 1.15))
-            lower = float(USER_CONFIG.get("judgement_lower", 0.85))
-            if target_kbps >= expected_kbps * upper:
-                level = "high"
-            elif target_kbps <= expected_kbps * lower:
-                level = "low"
-            else:
-                level = "standard"
-
+            suggested_kbps = int(round(expected_kbps))
             LOG.info(
-                "This is %s for the motion multiplier of %.2f based on the resolution %dx%d (%s) and the %s codec",
-                level,
-                mm,
-                width,
-                height,
+                "Suggested target bitrate: %d kbps (heuristic for %s, motion_mult=%.2f)",
+                suggested_kbps,
                 res_label,
-                codec_name,
+                mm,
             )
-            try:
-                suggested_kbps = int(round(expected_kbps))
-                LOG.info(
-                    "Suggested target bitrate: %d kbps (heuristic for %s, motion_mult=%.2f)",
-                    suggested_kbps,
-                    res_label,
-                    mm,
-                )
-            except Exception:
-                LOG.debug("Failed to compute suggested bitrate", exc_info=True)
         except Exception:
-            # Never fail the run due to the judgement helper
-            LOG.debug("Failed to compute bitrate judgement", exc_info=True)
+            LOG.warning("Failed to compute suggested bitrate", exc_info=True)
+    except Exception:
+        # Never fail the run due to the judgement helper
+        LOG.warning("Failed to compute bitrate judgement", exc_info=True)
 
     # Inspect streams
     streams = probe.get("streams", [])
