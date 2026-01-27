@@ -1200,7 +1200,14 @@ def process_file(path, args):
     LOG.debug(f"Using source bitrate from: {bitrate_source or 'unknown'}")
     source_kbps = bitrate / 1000.0
     # compute raw target from the source bitrate and the target factor
-    base_target = source_kbps * float(getattr(args, "target_factor", 0.7))
+    # If the user did not provide --target-factor, do not override it with the
+    # config default here; use the config default only as a fallback when
+    # needed later.
+    try:
+        tf_val = args.target_factor if getattr(args, "target_factor", None) is not None else float(USER_CONFIG.get("target_factor", 0.7))
+        base_target = source_kbps * float(tf_val)
+    except Exception:
+        base_target = source_kbps * float(USER_CONFIG.get("target_factor", 0.7))
 
     # Compute scale multiplier (default 1.0). We'll compute motion multiplier separately
     # so motion analysis can run even when the user is not requesting scaling.
@@ -2254,15 +2261,16 @@ def arg_parse(argv):
     except Exception:
         p.error("Invalid preferred_codec in config")
 
-    # Validate target factor
-    try:
-        if args.target_factor is None:
-            args.target_factor = float(USER_CONFIG.get("target_factor", 0.7))
-        tf = float(args.target_factor)
-        if not (0.0 < tf <= 1.0):
-            raise ValueError()
-    except Exception:
-        p.error("--target-factor must be a number > 0 and <= 1.0")
+    # Validate target factor only if provided on the CLI. We intentionally do
+    # not populate it from config here so the code can prefer the heuristic
+    # `suggested_kbps` when the user did not explicitly pass --target-factor.
+    if args.target_factor is not None:
+        try:
+            tf = float(args.target_factor)
+            if not (0.0 < tf <= 1.0):
+                raise ValueError()
+        except Exception:
+            p.error("--target-factor must be a number > 0 and <= 1.0")
 
     # Validate min/max if both provided
     if args.min_kbps is not None and args.max_kbps is not None:
