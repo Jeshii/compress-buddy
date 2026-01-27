@@ -150,7 +150,7 @@ where.exe ffprobe
 
 ```powershell
 ffmpeg -hwaccels
-ffmpeg -encoders | findstr /R /C:"nvenc" /C:"qsv" /C:"d3d11va" /C:"dxva2"
+ffmpeg -encoders
 ```
 
 - Are these some Windows hardware encoders names? Not sure!
@@ -193,20 +193,10 @@ python compress_buddy.py -o C:\tmp test.mp4
 
 - **3) Install ffmpeg and ffprobe**
 
-	Option A — Manual (recommended for control):
-
 	- Download a static build ("essentials" or "full") from https://www.gyan.dev/ffmpeg/builds/.
 	- Extract the zip to a folder such as `C:\ffmpeg` so the binaries live at `C:\ffmpeg\bin\ffmpeg.exe` and `C:\ffmpeg\bin\ffprobe.exe`.
 
-	Option B — Automatic (winget):
-
-	- In PowerShell you can run:
-
-		```powershell
-		winget install --id=Gyan.FFmpeg -e --source winget
-		```
-
-- **4) Add ffmpeg to PATH (if you installed manually)**
+- **4) Add ffmpeg to PATH**
 
 	- Run this PowerShell snippet to add `C:\ffmpeg\bin` to your user PATH (change path if you extracted elsewhere):
 
@@ -227,7 +217,8 @@ python compress_buddy.py -o C:\tmp test.mp4
 		where.exe ffmpeg
 		where.exe ffprobe
 		ffmpeg -version
-		ffmpeg -encoders | findstr /R /C:"libx264" /C:"libx265" /C:"nvenc" /C:"qsv"
+		ffmepg -h
+		ffmpeg -encoders"
 		```
 
 	- Confirm the commands print paths and a version. If encoders are missing, download the "full" ffmpeg build instead of "essentials".
