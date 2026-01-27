@@ -1302,25 +1302,13 @@ def process_file(path, args):
     except Exception:
         pass
 
-    target_kbps = int(max(300, base_target * scale_multiplier))
-    if args.min_kbps is not None:
-        target_kbps = max(int(args.min_kbps), target_kbps)
-    if args.max_kbps is not None:
-        target_kbps = min(int(args.max_kbps), target_kbps)
-    # Ensure we never target a bitrate higher than the original source bitrate
+    # Compute a base target from the source and scale multiplier. The final
+    # decision (prefer suggested_kbps vs. target_factor) is applied later
+    # after the suggested_kbps heuristic is computed.
     try:
-        if bitrate is not None:
-            target_kbps = min(int(bitrate / 1000.0), target_kbps)
+        target_kbps = int(max(300, base_target * scale_multiplier))
     except Exception:
-        # If anything goes wrong here, leave target_kbps as-is
-        pass
-    LOG.info(
-        "%s: duration=%.1fs source=%.0f kbps -> target=%d kbps",
-        inp.name,
-        duration,
-        source_kbps,
-        target_kbps,
-    )
+        target_kbps = int(max(300, base_target * scale_multiplier))
 
     # Bitrate quality suggestion
     try:
@@ -1405,6 +1393,34 @@ def process_file(path, args):
     except Exception:
         # Never fail the run due to the judgement helper
         LOG.warning("Failed to compute bitrate judgement", exc_info=True)
+
+    # Finalize target_kbps: prefer suggested_kbps unless user supplied --target-factor
+    try:
+        if getattr(args, "target_factor", None) is None and "suggested_kbps" in locals() and suggested_kbps:
+            target_kbps = int(max(300, int(suggested_kbps)))
+        else:
+            target_kbps = int(max(300, base_target * scale_multiplier))
+    except Exception:
+        target_kbps = int(max(300, base_target * scale_multiplier))
+
+    # Apply min/max caps and ensure we never target higher than source bitrate
+    if args.min_kbps is not None:
+        target_kbps = max(int(args.min_kbps), target_kbps)
+    if args.max_kbps is not None:
+        target_kbps = min(int(args.max_kbps), target_kbps)
+    try:
+        if bitrate is not None:
+            target_kbps = min(int(bitrate / 1000.0), target_kbps)
+    except Exception:
+        pass
+
+    LOG.info(
+        "%s: duration=%.1fs source=%.0f kbps -> target=%d kbps",
+        inp.name,
+        duration,
+        source_kbps,
+        target_kbps,
+    )
 
     # Inspect streams
     streams = probe.get("streams", [])
