@@ -262,31 +262,42 @@ def choose_best_hw_encoder(preferred_codec: str) -> tuple[str, bool]:
 
     Returns (None, None) if no suitable hardware encoder found.
     """
-    pref = preferred_codec.lower()
+    pref = (preferred_codec or "").lower()
     # candidate lists ordered by preference
 
     encoders = get_ffmpeg_encoders()
     hwaccels = get_ffmpeg_hwaccels()
 
+    # Normalize sets to lowercase for matching
+    enc_l = {e: e.lower() for e in encoders}
+    hw_l = {h: h.lower() for h in hwaccels}
+
+    # Known hw tokens to look for in encoder names
+    known_hw_tokens = ["qsv", "cuda", "cuvid", "nvenc", "nvdec", "vaapi", "videotoolbox", "dxva2", "d3d11va", "amf"]
+
+    def _match_pref(pref_list):
+        # prefer encoders that contain both a hw token and the codec prefix
+        for hw in hw_l.values():
+            for enc, el in enc_l.items():
+                if hw in el and any(p in el for p in pref_list):
+                    return enc, hw
+        # fallback: look for known hw tokens embedded in encoder name
+        for token in known_hw_tokens:
+            for enc, el in enc_l.items():
+                if token in el and any(p in el for p in pref_list):
+                    # choose the most likely hwaccel name if available
+                    hw_choice = token if token in hw_l.values() else None
+                    return enc, hw_choice
+        # final fallback: return any software encoder matching pref
+        for enc, el in enc_l.items():
+            if any(p in el for p in pref_list):
+                return enc, None
+        return None, None
+
     if pref == "h264":
-        for hw in hwaccels:
-            for enc in encoders:
-                el = enc.lower()
-                if hw in el and pref in el:
-                    return el, True
-        for enc in encoders:
-            if pref in enc.lower():
-                return enc, False
+        return _match_pref(["h264", "avc", "x264"]) or (None, None)
     if pref in ("h265", "hevc"):
-        for hw in hwaccels:
-            for enc in encoders:
-                el = enc.lower()
-                if hw in el and ("h265" in el or "hevc" in el):
-                    return el, True
-        for enc in encoders:
-            el = enc.lower()
-            if "h265" in el or "hevc" in el:
-                return enc, False
+        return _match_pref(["h265", "hevc", "x265"]) or (None, None)
     return None, None
 
 
@@ -405,7 +416,8 @@ def compute_bitrate_and_duration(path, args=None):
 
 def build_common_base(inp, hardware_accel=None, error_level="error"):
     base = ["ffmpeg", "-y", "-hide_banner", "-loglevel", error_level]
-    if hardware_accel:
+    # Only append hwaccel if a sensible string token was provided
+    if hardware_accel and isinstance(hardware_accel, str):
         base += ["-hwaccel", hardware_accel]
     base += ["-i", str(inp)]
     return base
@@ -434,13 +446,16 @@ def build_encode_tail(
     """
     tail = []
 
-    # map video/audio/subs explicitly. When any -map is used, ffmpeg
-    # disables automatic mapping so we must include video when present.
-    if has_video:
-        tail += ["-map", "0:v?"]
-    if has_audio:
-        tail += ["-map", "0:a?"]
-    tail += ["-map", "0:s?"]
+    # mapping: by default we explicitly map video/audio/subs. When any
+    # -map is used, ffmpeg disables automatic mapping so we must include
+    # the streams we want. If the user requests `--auto-map`, skip adding
+    # explicit -map flags and let ffmpeg perform its automatic selection.
+    if not getattr(args, "auto_map", False):
+        if has_video:
+            tail += ["-map", "0:v?"]
+        if has_audio:
+            tail += ["-map", "0:a?"]
+        tail += ["-map", "0:s?"]
 
     # Video encoding selection - rely on caller-provided tokens/values
     if has_video:
@@ -1599,12 +1614,22 @@ def main(argv):
             LOG.info(f"Using encoder {args.encoder}.")
             args.codec = args.encoder
             # try to infer a hwaccel from encoder token
-            if "qsv" in args.encoder:
-                setattr(args, "_hwaccel", "qsv")
-            elif "videotoolbox" in args.encoder:
-                setattr(args, "_hwaccel", "videotoolbox")
-            elif "vaapi" in args.encoder:
-                setattr(args, "_hwaccel", "vaapi")
+            enc_low = args.encoder.lower()
+            inferred = None
+            if "qsv" in enc_low:
+                inferred = "qsv"
+            elif "videotoolbox" in enc_low:
+                inferred = "videotoolbox"
+            elif "vaapi" in enc_low:
+                inferred = "vaapi"
+            elif "nvenc" in enc_low or "cuvid" in enc_low or "nvdec" in enc_low:
+                # NVENC/CUDA family
+                inferred = "cuda"
+            elif "amf" in enc_low:
+                # AMD AMF typically pairs with dxva/d3d11 on Windows
+                inferred = "d3d11va"
+            if inferred:
+                setattr(args, "_hwaccel", inferred)
             # If user requested 10-bit output, probe whether this encoder accepts 10-bit
             try:
                 if getattr(args, "bit", USER_CONFIG.get("default_bit_depth", 10)) == 10:
@@ -1623,7 +1648,30 @@ def main(argv):
                     f"Auto-selected hardware encoder {chosen} (hwaccel={hwaccel})."
                 )
                 args.codec = chosen
-                setattr(args, "_hwaccel", hwaccel)
+                # hwaccel may be None or a string; prefer explicit string
+                if hwaccel:
+                    setattr(args, "_hwaccel", hwaccel)
+                else:
+                    # Try to infer a sensible hwaccel on Windows from encoder token
+                    try:
+                        if platform.system() == "Windows":
+                            avail_hw = get_ffmpeg_hwaccels()
+                            cl = chosen.lower()
+                            if "nvenc" in cl or "cuvid" in cl or "nvdec" in cl:
+                                if "cuda" in avail_hw:
+                                    setattr(args, "_hwaccel", "cuda")
+                                elif "d3d11va" in avail_hw:
+                                    setattr(args, "_hwaccel", "d3d11va")
+                            elif "qsv" in cl:
+                                if "qsv" in avail_hw:
+                                    setattr(args, "_hwaccel", "qsv")
+                            elif "amf" in cl:
+                                if "d3d11va" in avail_hw:
+                                    setattr(args, "_hwaccel", "d3d11va")
+                                elif "dxva2" in avail_hw:
+                                    setattr(args, "_hwaccel", "dxva2")
+                    except Exception:
+                        pass
                 # If user requested 10-bit output, probe whether this encoder accepts 10-bit
                 try:
                     if (
@@ -2107,6 +2155,11 @@ def arg_parse(argv):
         "--no-bell",
         action="store_true",
         help="Do not ring terminal bell on completion",
+    )
+    p.add_argument(
+        "--auto-map",
+        action="store_true",
+        help="Use ffmpeg's automatic stream selection (do not add explicit -map flags)",
     )
     p.add_argument(
         "--motion-multiplier",
