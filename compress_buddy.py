@@ -331,8 +331,6 @@ def supports_10bit_hw(encoder_name: str) -> bool:
     """Return True if ffmpeg accepts encoding with the given encoder name and 10-bit pixel format.
 
     This runs a very short ffmpeg lavfi test encode using `-pix_fmt yuv420p10le` and checks the returncode.
-    It's a heuristic — some encoders may accept the flag but still downcast; this checks whether ffmpeg
-    accepts the combination without immediate error.
     """
     try:
         if not encoder_name:
@@ -378,15 +376,9 @@ def select_encoder_settings(args: argparse.Namespace) -> str:
 
 
 def run_cmd(cmd: list, dry_run: bool = False) -> subprocess.CompletedProcess:
-    """Run an external command and return a CompletedProcess.
-
-    If `args` is provided and `getattr(args, 'dry_run', False)` is True,
-    the command will not be executed; instead a fake successful
-    CompletedProcess with empty stdout/stderr is returned.
-    """
+    """Run an external command and return a CompletedProcess."""
     LOG.info(f"Running command: {format_cmd_for_logging(cmd)}")
     if dry_run:
-        # In dry-run mode, don't execute external commands; return a fake success.
         LOG.debug("Dry-run: skipping execution of external command.")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -1200,9 +1192,6 @@ def process_file(path, args):
     LOG.debug(f"Using source bitrate from: {bitrate_source or 'unknown'}")
     source_kbps = bitrate / 1000.0
     # compute raw target from the source bitrate and the target factor
-    # If the user did not provide --target-factor, do not override it with the
-    # config default here; use the config default only as a fallback when
-    # needed later.
     try:
         tf_val = args.target_factor if getattr(args, "target_factor", None) is not None else float(USER_CONFIG.get("target_factor", 0.7))
         base_target = source_kbps * float(tf_val)
@@ -1328,6 +1317,27 @@ def process_file(path, args):
 
         width = int(vid_stream.get("width") or 0) if vid_stream else 0
         height = int(vid_stream.get("height") or 0) if vid_stream else 0
+        # Respect user-requested max dimensions when suggesting bitrate: compute
+        # the effective output resolution and use that for heuristics so that
+        # setting --max-width/--max-height lowers suggested bitrate appropriately.
+        try:
+            eff_w = width
+            eff_h = height
+            if (getattr(args, "max_width", None) is not None or getattr(args, "max_height", None) is not None) and width and height:
+                in_aspect = float(width) / float(height) if height else 0
+                mw = args.max_width
+                mh = args.max_height
+                if mw is None and mh is not None:
+                    mw = int(mh * in_aspect)
+                elif mh is None and mw is not None:
+                    mh = int(mw / in_aspect)
+                mw = mw or 1920
+                mh = mh or 1080
+                eff_w = min(width, mw)
+                eff_h = min(height, mh)
+        except Exception:
+            eff_w = width
+            eff_h = height
         codec_name = (
             vid_stream.get("codec_name")
             if vid_stream and vid_stream.get("codec_name")
@@ -1335,16 +1345,17 @@ def process_file(path, args):
         )
 
         # resolution category factors (relative to a baseline 1080p expectation)
-        if width >= 7680 or height >= 4320:
+        # Use effective (possibly scaled) resolution for classification
+        if eff_w >= 7680 or eff_h >= 4320:
             res_factor = float(USER_CONFIG.get("res_factor_8k", 3.5))
             res_label = "8k"
-        elif width >= 3840 or height >= 2160:
+        elif eff_w >= 3840 or eff_h >= 2160:
             res_factor = float(USER_CONFIG.get("res_factor_4k", 1.8))
             res_label = "4k"
-        elif width >= 1920 or height >= 1080:
+        elif eff_w >= 1920 or eff_h >= 1080:
             res_factor = float(USER_CONFIG.get("res_factor_1080p", 1.0))
             res_label = "1080p"
-        elif width >= 1280 or height >= 720:
+        elif eff_w >= 1280 or eff_h >= 720:
             res_factor = float(USER_CONFIG.get("res_factor_720p", 0.6))
             res_label = "720p"
         else:
@@ -1462,18 +1473,45 @@ def process_file(path, args):
                 )
 
     if args.dry_run:
-        LOG.info(
-            "   (dry-run) mode=%s video=%s audio=%s subs=%s",
-            args.mode,
-            has_video,
-            has_audio,
-            has_subs,
-        )
+        # Report dry-run summary plus the bitrate judgement (high/standard/low)
+        level = locals().get("level", "unknown")
+        suggested_kbps = locals().get("suggested_kbps", None)
+        try:
+            LOG.info(
+                "   (dry-run) mode=%s video=%s audio=%s subs=%s",
+                args.mode,
+                has_video,
+                has_audio,
+                has_subs,
+            )
+            if suggested_kbps:
+                LOG.info(
+                    "   judgement=%s suggested_kbps=%d target_kbps=%d",
+                    level,
+                    int(suggested_kbps),
+                    int(target_kbps),
+                )
+            else:
+                LOG.info("   judgement=%s target_kbps=%s", level, str(target_kbps))
+        except Exception:
+            LOG.info("   (dry-run) mode=%s video=%s audio=%s subs=%s", args.mode, has_video, has_audio, has_subs)
         return
 
     # prepare output parent and chunking parameters
     out.parent.mkdir(parents=True, exist_ok=True)
-    # prefer explicit seconds flag when present; fall back to minutes for backward compatibility
+    # If the user requested only-high behavior, skip files not judged 'high'
+    try:
+        if getattr(args, "only_high", False):
+            level = locals().get("level", None)
+            if level is None:
+                LOG.warning("--only-high was requested but judgement could not be determined, skipping %s...", inp.name)
+                return
+            if level != "high":
+                LOG.info("Skipping %s: judged %s (only compressing 'high')", inp.name, level)
+                return
+    except Exception:
+        pass
+    # prefer explicit seconds flag when present
     chunk_seconds = int(getattr(args, "chunk_seconds", 0) or 0)
     if not chunk_seconds:
         chunk_minutes = getattr(args, "chunk_minutes", 0) or 0
@@ -1678,8 +1716,7 @@ def main(argv):
                 if getattr(args, "bit", USER_CONFIG.get("default_bit_depth", 10)) == 10:
                     if not supports_10bit_hw(args.codec):
                         LOG.warning(
-                            "Requested 10-bit output but hardware encoder %s does not appear to support 10-bit; falling back to 8-bit.",
-                            args.codec,
+                            f"Requested 10-bit output but hardware encoder {args.codec} does not appear to support 10-bit, falling back to 8-bit...",
                         )
                         args.bit = 8
             except Exception:
@@ -1691,7 +1728,7 @@ def main(argv):
                     f"Auto-selected hardware encoder {chosen} (hwaccel={hwaccel})."
                 )
                 args.codec = chosen
-                # hwaccel may be None or a string; prefer explicit string
+
                 if hwaccel:
                     setattr(args, "_hwaccel", hwaccel)
                 else:
@@ -1723,8 +1760,7 @@ def main(argv):
                     ):
                         if not supports_10bit_hw(args.codec):
                             LOG.warning(
-                                "Requested 10-bit output but auto-selected hardware encoder %s does not appear to support 10-bit; falling back to 8-bit.",
-                                args.codec,
+                                f"Requested 10-bit output but auto-selected hardware encoder {args.codec} does not appear to support 10-bit, falling back to 8-bit...",
                             )
                             args.bit = 8
                 except Exception:
@@ -2209,6 +2245,12 @@ def arg_parse(argv):
         type=float,
         default=None,
         help="Specify motion multiplier. >1.0 increases bitrate for high-motion videos, <1.0 decreases for low-motion.",
+    )
+
+    p.add_argument(
+        "--only-high",
+        action="store_true",
+        help="Only compress files judged as 'high' bitrate",
     )
 
     p.add_argument(
