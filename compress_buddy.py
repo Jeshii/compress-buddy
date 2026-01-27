@@ -1694,11 +1694,11 @@ def main(argv):
                 hw = sorted(get_ffmpeg_hwaccels())
                 decs = sorted(get_ffmpeg_decoders())
                 LOG.error(
-                    f"Detected encoders (sample): {', '.join(encs[:40]) or '<none>'}"
+                    f"Detected encoders: {', '.join(encs) or '<none>'}"
                 )
                 LOG.error(f"Detected hwaccels: {', '.join(hw) or '<none>'}")
                 LOG.error(
-                    f"Detected decoders (sample): {', '.join(decs[:40]) or '<none>'}"
+                    f"Detected decoders: {', '.join(decs) or '<none>'}"
                 )
                 sys.exit(1)
     # For CRF mode, map 0-100 user quality to ffmpeg CRF (0-51, inverted mapping)
