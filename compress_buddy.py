@@ -1335,7 +1335,10 @@ def process_file(path, args):
         )
 
         # resolution category factors (relative to a baseline 1080p expectation)
-        if width >= 3840 or height >= 2160:
+        if width >= 7680 or height >= 4320:
+            res_factor = float(USER_CONFIG.get("res_factor_8k", 3.5))
+            res_label = "8k"
+        elif width >= 3840 or height >= 2160:
             res_factor = float(USER_CONFIG.get("res_factor_4k", 1.8))
             res_label = "4k"
         elif width >= 1920 or height >= 1080:
@@ -1378,22 +1381,13 @@ def process_file(path, args):
         else:
             level = "standard"
 
-        LOG.info(
-            "This is %s for the motion multiplier of %.2f based on the resolution %dx%d (%s) and the %s codec",
-            level,
-            mm,
-            width,
-            height,
-            res_label,
-            codec_name,
+        LOG.debug(
+            f"{target_kbps} is {level} for the motion multiplier of {mm} based on the resolution {width}x{height} ({res_label}) and the {codec_name} codec"
         )
         try:
             suggested_kbps = int(round(expected_kbps))
             LOG.info(
-                "Suggested target bitrate: %d kbps (heuristic for %s, motion_mult=%.2f)",
-                suggested_kbps,
-                res_label,
-                mm,
+                f"Suggested target bitrate: {suggested_kbps} kbps (for {res_label}, motion_mult={mm:.2f}, codec={codec_name})"
             )
         except Exception:
             LOG.warning("Failed to compute suggested bitrate", exc_info=True)
