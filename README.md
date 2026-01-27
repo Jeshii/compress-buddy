@@ -59,11 +59,7 @@ python3 compress_buddy.py --chunk-minutes 15 -o /tmp/outdir long_video.mov
 Join multiple inputs:
 
 ```bash
-# process multiple inputs as a single logical input (one encode pass)
 python3 compress_buddy.py --join -o /tmp/outdir part1.mov part2.mov
-
-# quick-join: perform a fast copy-based concat (-c copy), fail if incompatible, then process the joined result
-python3 compress_buddy.py --quick-join -o /tmp/outdir part1.mov part2.mov
 ```
 
 ## Options
@@ -101,8 +97,7 @@ Output
 - `--chunk-minutes <N>` — split output into N-minute segments. Segments are written to a temporary directory next to the output and then moved into place after encoding.
 - `--overwrite` — overwrite existing outputs.
 - `--delete-original` — delete original file after successful compression.
-- `--join` - join videos together during processing.
-- `--quick-join` - attempt to join videos together quickly with ffmpeg copy and then pass that on to processing.
+- `--join` - attempt to join videos together quickly with ffmpeg copy and then pass that on to processing.
 
 Performance / Resource Control
 - `--workers <N>` — number of parallel workers (we force `1` for macOS hardware mode for stability).
@@ -118,7 +113,7 @@ Notes
 
 ## Other Notes & Gotchas
 
-- ffprobe is used to check for bitrates on the source. We prefer per-stream `bit_rate` when available and fall back to the container-level `format.bit_rate` for formats like WebM/Matroska. The target bitrate is computed as `source_kbps * --target-factor` (default 0.7). `--min-kbps` and `--max-kbps` are optional and, if provided, clamp the computed target. If ffprobe cannot determine a bitrate at all the tool will ask you to provide `--min-kbps` or `--max-kbps` explicitly rather than guessing from file size.
+- ffprobe is used to check for bitrates on the source. By default, we calculate a recommended bitrate based on the ini baseline, resolution, and codec. We prefer per-stream `bit_rate` when available and fall back to the container-level `format.bit_rate` for formats like WebM/Matroska. You can also use the `--target-factor` flag to calculate a target bitrate. The target bitrate is computed as `source_kbps * --target-factor` (default 0.7). `--min-kbps` and `--max-kbps` are optional and, if provided, clamp the computed target. If ffprobe cannot determine a bitrate at all the tool will ask you to provide `--min-kbps` or `--max-kbps` explicitly rather than guessing from file size.
 - Quality mapping: `--quality` is a user-facing 0–100 scale, with 0 being worst and 100 being best. This is inverted in CRF mode automatically to keep things simple.
 - macOS + VideoToolbox: hardware mode uses VideoToolbox and we force `--workers 1` on Darwin for stability.
 - Audio handling: if the input audio is AAC or you pass `--copy-audio`, audio will be copied. Otherwise it will be re-encoded to AAC at 128k.
