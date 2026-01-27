@@ -490,8 +490,9 @@ def build_encode_tail(
     except Exception:
         bit_depth = int(USER_CONFIG.get("default_bit_depth", 10))
 
-    pix = "yuv420p10le" if bit_depth == 10 else "yuv420p"
-    tail += ["-pix_fmt", pix]
+    if "videotoolbox" in (vcodec or "").lower():
+        pix = "yuv420p10le" if bit_depth == 10 else "yuv420p"
+        tail += ["-pix_fmt", pix]
 
     # If 10-bit requested and output codec is HEVC/x265, add profile hints
     vcodec_l = (vcodec or "").lower() if vcodec is not None else ""
