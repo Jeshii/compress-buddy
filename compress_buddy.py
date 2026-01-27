@@ -129,6 +129,11 @@ def load_user_config():
         "res_factor_720p": 0.6,
         "res_factor_sd": 0.35,
         "suffix": "mp4",
+        # config values we also want available to the runtime
+        "preferred_codec": "size",
+        "preferred_mode": "hardware",
+        "default_quality": 50,
+        "fps_baseline": 30.0,
     }
 
     cp = configparser.ConfigParser()
@@ -172,6 +177,27 @@ def load_user_config():
             "suffix",
         ):
             out[k] = _getfloat(k)
+
+        # Read some string / integer preferences that aren't floats
+        try:
+            out["preferred_codec"] = sec.get("preferred_codec", out.get("preferred_codec"))
+        except Exception:
+            out["preferred_codec"] = out.get("preferred_codec")
+
+        try:
+            out["preferred_mode"] = sec.get("preferred_mode", out.get("preferred_mode"))
+        except Exception:
+            out["preferred_mode"] = out.get("preferred_mode")
+
+        try:
+            out["default_quality"] = int(sec.get("default_quality", out.get("default_quality")))
+        except Exception:
+            out["default_quality"] = out.get("default_quality")
+
+        try:
+            out["fps_baseline"] = float(sec.get("fps_baseline", out.get("fps_baseline")))
+        except Exception:
+            out["fps_baseline"] = out.get("fps_baseline")
 
     return out
 
