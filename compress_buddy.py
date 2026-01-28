@@ -1188,15 +1188,18 @@ def process_file(path, args):
     else:
         out = inp.with_suffix(f".{args.suffix}")
     try:
-        # If the output exists and overwrite not requested, normally skip.
-        # However, when the output path is the same file as the input (this
-        # happens during the join flow where we concat to a temporary
-        # joined file then process that same path), we should not skip.
+        # If the output exists and --overwrite not requested, normally skip.
+        # If the output path resolves to the same path as the input, require
+        # explicit confirmation via `--overwrite` to avoid accidentally
+        # deleting the only copy (we used to continue here which could lead
+        # to deleting the original after skipping the move).
         if out.exists() and not args.overwrite:
             try:
                 if out.resolve() == inp.resolve():
-                    # output is the same file as input — continue processing
-                    pass
+                    LOG.error(
+                        f"Output path {out} equals input {inp}. Refusing to proceed without --overwrite."
+                    )
+                    return
                 else:
                     LOG.warning(
                         f"{out.name} exists, skipping... (use --overwrite to replace)"
