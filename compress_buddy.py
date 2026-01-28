@@ -326,6 +326,24 @@ def choose_best_hw_encoder(preferred_codec: str) -> tuple[str, bool]:
         return _match_pref(["h265", "hevc", "x265"]) or (None, None)
     return None, None
 
+def is_apple_silicon() -> bool:
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+def ffmpeg_version_tuple() -> tuple[int, int, int]:
+    res = run_cmd(["ffmpeg", "-version"], dry_run=False)
+    if res.returncode != 0 or not res.stdout:
+        return (0, 0, 0)
+    m = re.search(r"ffmpeg version\s+(\d+)\.(\d+)(?:\.(\d+))?", res.stdout)
+    if not m:
+        return (0, 0, 0)
+    major = int(m.group(1))
+    minor = int(m.group(2))
+    patch = int(m.group(3) or 0)
+    return (major, minor, patch)
+
+def ffmpeg_is_at_least(major:int, minor:int) -> bool:
+    v = ffmpeg_version_tuple()
+    return (v[0], v[1]) >= (major, minor)
 
 def supports_10bit_hw(encoder_name: str) -> bool:
     """Return True if ffmpeg accepts encoding with the given encoder name and 10-bit pixel format.
@@ -491,7 +509,19 @@ def build_encode_tail(
                 if "videotoolbox" in (vcodec or "").lower():
                     tail += ["-constant_bit_rate", "1"]
             if quality is not None:
-                tail += ["-q:v", str(int(quality))]
+                vcodec_l = (vcodec or "").lower()
+                if "videotoolbox" in vcodec_l:
+                    if is_apple_silicon() and ffmpeg_is_at_least(4, 4):
+                        tail += ["-q:v", str(int(quality))]
+                    else:
+                        LOG.error(
+                            "VideoToolbox constant-quality (-q:v) requires Apple Silicon and ffmpeg >= 4.4."
+                        )
+                        raise RuntimeError(
+                            "VideoToolbox constant-quality (-q:v) requires Apple Silicon and ffmpeg >= 4.4."
+                        )
+                else:
+                    tail += ["-q:v", str(int(quality))]
 
     # threads
     if getattr(args, "threads", None) is not None:
@@ -680,9 +710,9 @@ def log_total_segments(orig_size, out, total_new_size, created_count):
 
 
 def map_quality_to_crf(q):
-    """Map a user-facing quality in 0-100 (100=best) to ffmpeg CRF 0-51 (0=best).
+    """Map a user-facing quality in 1-100 (100=best) to ffmpeg CRF 0-51 (0=best).
 
-    This performs a linear, inverted mapping where 100 -> 0 and 0 -> 51.
+    This performs a linear, inverted mapping where 100 -> 0 and 1 -> 51.
     Values are clamped to the valid ranges.
     """
     if q is None:
@@ -691,7 +721,7 @@ def map_quality_to_crf(q):
         qv = int(q)
     except Exception:
         return 28
-    qv = max(0, min(100, qv))
+    qv = max(1, min(100, qv))
     crf = int(round((100 - qv) * 51.0 / 100.0))
     return max(0, min(51, crf))
 
@@ -2096,12 +2126,7 @@ def arg_parse(argv):
         "--quality",
         type=int,
         default=None,
-        help="Quality value, 0 being worst and 100 being best",
-    )
-    p.add_argument(
-        "--quality-demo",
-        action="store_true",
-        help="Create a demo video showing quality steps 0..100 split into 10 parts",
+        help="Quality value, 1 being worst and 100 being best",
     )
     p.add_argument(
         "--codec",
