@@ -75,28 +75,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-
-def setup_logging():
-    fmt = "[%(asctime)s] %(levelname)s %(message)s"
-    datefmt = "%Y/%m/%d %H:%M:%S %z"
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
-    logging.basicConfig(level=logging.INFO, handlers=[handler])
-
-
-LOG = logging.getLogger("compress_buddy")
-
-
-def format_cmd_for_logging(cmd):
-    """Return a human-readable command string for logs, using platform-appropriate quoting."""
-    if os.name == "nt":
-        try:
-            return subprocess.list2cmdline(cmd)
-        except Exception:
-            return " ".join(shlex.quote(x) for x in cmd)
-    return " ".join(shlex.quote(x) for x in cmd)
-
-
 def load_user_config():
     """Load user configuration from standard locations and return a dict of values.
 
@@ -201,9 +179,25 @@ def load_user_config():
 
     return out
 
-
-# Global user config read at import time
+# Globals
+LOG = logging.getLogger("compress_buddy")
 USER_CONFIG = load_user_config()
+
+def setup_logging():
+    fmt = "[%(asctime)s] %(levelname)s %(message)s"
+    datefmt = "%Y/%m/%d %H:%M:%S %z"
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+
+def format_cmd_for_logging(cmd):
+    """Return a human-readable command string for logs, using platform-appropriate quoting."""
+    if os.name == "nt":
+        try:
+            return subprocess.list2cmdline(cmd)
+        except Exception:
+            return " ".join(shlex.quote(x) for x in cmd)
+    return " ".join(shlex.quote(x) for x in cmd)
 
 
 def ensure_ffmpeg_available():
@@ -514,9 +508,6 @@ def build_encode_tail(
                     if is_apple_silicon() and ffmpeg_is_at_least(4, 4):
                         tail += ["-q:v", str(int(quality))]
                     else:
-                        LOG.error(
-                            "VideoToolbox constant-quality (-q:v) requires Apple Silicon and ffmpeg >= 4.4."
-                        )
                         raise RuntimeError(
                             "VideoToolbox constant-quality (-q:v) requires Apple Silicon and ffmpeg >= 4.4."
                         )
@@ -985,147 +976,6 @@ def encode_and_handle_output(
     return True, speed, elapsed_sec, final_out_time
 
 
-def process_concat_list(concat_path: str, inputs: list, args):
-    """Encode directly from a concat list (single ffmpeg invocation).
-
-    This function builds an ffmpeg command that reads the concat demuxer list
-    and then appends the shared encode tail produced by `build_encode_tail()`.
-    It handles chunking and moving segments (if requested) just like `process_file()`.
-    """
-    try:
-        # Determine output directory and name
-        # Respect normalized args.output_file / args.output_is_dir added in arg_parse
-        if getattr(args, "output_file", None):
-            out = Path(args.output_file)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out_dir = out.parent
-        elif getattr(args, "output_is_dir", False):
-            out_dir = Path(args.output)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out = out_dir / ("joined." + args.suffix)
-        else:
-            out_dir = Path(inputs[0]).parent
-            out = out_dir / ("joined." + args.suffix)
-
-        # prefer explicit seconds flag when present
-        chunk_seconds = int(getattr(args, "chunk_seconds", 0) or 0)
-        if not chunk_seconds:
-            chunk_minutes = getattr(args, "chunk_minutes", 0) or 0
-            chunk_seconds = int(chunk_minutes) * 60
-        chunking = int(chunk_seconds) > 0
-
-        tmp_dir = None
-        tmp_path = None
-        tmp_pattern = None
-        if chunking:
-            tmp_dir = Path(tempfile.mkdtemp(prefix=out.name + ".", dir=str(out.parent)))
-            tmp_pattern = str(tmp_dir / (Path(inputs[0]).stem + ".%03d" + out.suffix))
-        else:
-            with tempfile.NamedTemporaryFile(
-                prefix=out.stem + ".",
-                suffix=out.suffix,
-                dir=str(out.parent),
-                delete=False,
-            ) as tf:
-                tmp_path = Path(tf.name)
-
-        # build initial concat input command
-        top_cmd = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            args.log_level.lower(),
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            concat_path,
-        ]
-
-        # choose codec options using centralized selection
-        vcodec = None
-        bitrate_kbps = None
-        try:
-            vcodec = select_encoder_settings(args)
-        except RuntimeError as e:
-            LOG.error(str(e))
-            LOG.error("no suitable encoder found for concat-encode. Aborting.")
-            return
-
-        tail_kwargs = {
-            "has_video": True,
-            "has_audio": True,
-            "vcodec": vcodec,
-            "mode": args.mode,
-            "bitrate_kbps": bitrate_kbps,
-            "tmp_path": tmp_path,
-            "chunking": chunking,
-            "tmp_pattern": tmp_pattern,
-            "out_path": out,
-        }
-        if getattr(args, "quality", None) is not None:
-            tail_kwargs["quality"] = getattr(args, "quality")
-
-        tail = build_encode_tail(args, **tail_kwargs)
-
-        cmd = top_cmd + tail
-        LOG.info("Running concat-encode...")
-        # Honor dry-run: log the final ffmpeg command and do not execute it.
-        if getattr(args, "dry_run", False):
-            LOG.info("(dry-run) Would run: %s", format_cmd_for_logging(cmd))
-            # In dry-run mode we don't produce files
-            return
-
-        # compute total duration (sum of input durations) so progress %/ETA can be computed
-        total_duration = 0.0
-        try:
-            for f in inputs:
-                try:
-                    _, d, _, _ = compute_bitrate_and_duration(f, args)
-                    total_duration += float(d or 0.0)
-                except Exception:
-                    # ignore individual probe failures
-                    pass
-        except Exception:
-            total_duration = None
-
-        # compute combined original size for logging
-        try:
-            orig_size = 0
-            for f in inputs:
-                try:
-                    p = Path(f)
-                    if p.exists():
-                        orig_size += p.stat().st_size
-                except Exception:
-                    pass
-        except Exception:
-            orig_size = None
-
-        success, _, _, _ = encode_and_handle_output(
-            cmd,
-            out,
-            inputs,
-            args,
-            tmp_path=tmp_path,
-            tmp_dir=tmp_dir,
-            chunking=chunking,
-            total_duration=total_duration,
-            orig_size=orig_size,
-        )
-        if not success:
-            sys.exit(1)
-
-        return
-    finally:
-        try:
-            Path(concat_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
 def write_symlinked_concat(files: list, concat_path: str):
     """Create a temporary directory containing safe symlinked names for each
     input file and write a concat demuxer list that references those symlinks.
@@ -1169,6 +1019,8 @@ def write_symlinked_concat(files: list, concat_path: str):
 
 def process_file(path, args):
     inp = Path(path)
+    encoding_completed = False
+
     # capture original size early for logging
     try:
         orig_size = inp.stat().st_size
@@ -1623,7 +1475,12 @@ def process_file(path, args):
         if getattr(args, "quality", None) is not None:
             tail_kwargs["quality"] = getattr(args, "quality")
 
-        tail = build_encode_tail(args, **tail_kwargs)
+        try:
+            tail = build_encode_tail(args, **tail_kwargs)
+        except RuntimeError as e:
+            LOG.error(str(e))
+            LOG.error("failed to build encode tail. Aborting.")
+            return
 
         cmd += tail
 
@@ -1640,6 +1497,7 @@ def process_file(path, args):
         )
         if not success:
             return
+        encoding_completed = True  # Set flag to True upon successful encoding
         LOG.info(f"Encode speed: {speed:.2f}x realtime")
         try:
             hrs = int(elapsed_sec // 3600)
@@ -1654,13 +1512,21 @@ def process_file(path, args):
             )
         except Exception:
             pass
-        if args.delete_original:
-            inp.unlink(missing_ok=True)
-            LOG.info(f"Deleted original file {inp.name}")
     finally:
         # ring terminal bell to notify completion of encode unless disabled
         if not args.no_bell:
             ring_bell()
+
+        # Only delete original if encoding actually completed successfully
+        if encoding_completed and args.delete_original:
+            try:
+                if out.resolve() != inp.resolve():
+                    inp.unlink(missing_ok=True)
+                    LOG.info(f"Deleted original file {inp.name}")
+                else:
+                    LOG.warning(f"Not deleting {inp.name} because output overwrote it in-place")
+            except Exception as e:
+                LOG.warning(f"Failed to delete original: {e}")
 
         # cleanup temp artifacts
         try:
@@ -1768,20 +1634,20 @@ def main(argv):
                     # Try to infer a sensible hwaccel on Windows from encoder token
                     try:
                         if platform.system() == "Windows":
-                            avail_hw = get_ffmpeg_hwaccels()
+                            hwaccels = get_ffmpeg_hwaccels()
                             cl = chosen.lower()
                             if "nvenc" in cl or "cuvid" in cl or "nvdec" in cl:
-                                if "cuda" in avail_hw:
+                                if "cuda" in hwaccels:
                                     setattr(args, "_hwaccel", "cuda")
-                                elif "d3d11va" in avail_hw:
+                                elif "d3d11va" in hwaccels:
                                     setattr(args, "_hwaccel", "d3d11va")
                             elif "qsv" in cl:
-                                if "qsv" in avail_hw:
+                                if "qsv" in hwaccels:
                                     setattr(args, "_hwaccel", "qsv")
                             elif "amf" in cl:
-                                if "d3d11va" in avail_hw:
+                                if "d3d11va" in hwaccels:
                                     setattr(args, "_hwaccel", "d3d11va")
-                                elif "dxva2" in avail_hw:
+                                elif "dxva2" in hwaccels:
                                     setattr(args, "_hwaccel", "dxva2")
                     except Exception:
                         pass
