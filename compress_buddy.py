@@ -1529,12 +1529,12 @@ def process_file(path, args):
 
     # prepare output parent and chunking parameters
     out.parent.mkdir(parents=True, exist_ok=True)
-    # If the user requested only-high behavior, skip files not judged 'high'
+    # If the user requested high-only behavior, skip files not judged 'high'
     try:
-        if getattr(args, "only_high", False):
+        if getattr(args, "high_only", False):
             level = locals().get("level", None)
             if level is None:
-                LOG.warning("--only-high was requested but judgement could not be determined, skipping %s...", inp.name)
+                LOG.warning("--high-only was requested but judgement could not be determined, skipping %s...", inp.name)
                 return
             if level != "high":
                 LOG.info("Skipping %s: judged %s (only compressing 'high')", inp.name, level)
@@ -2273,7 +2273,7 @@ def arg_parse(argv):
     )
 
     p.add_argument(
-        "--only-high",
+        "--high-only",
         action="store_true",
         help="Only compress files judged as 'high' bitrate",
     )
