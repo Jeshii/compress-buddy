@@ -1319,6 +1319,22 @@ def process_file(path, args):
         target_kbps,
     )
 
+    # If the final target bitrate is greater than or equal to the source
+    # bitrate, there's no benefit in re-encoding — skip to avoid quality
+    # loss and wasted work.
+    try:
+        if bitrate is not None and target_kbps >= source_kbps:
+            LOG.info(
+                "%s: target (%d kbps) >= source (%.0f kbps); skipping encode",
+                inp.name,
+                target_kbps,
+                source_kbps,
+            )
+            return
+    except Exception:
+        # If anything goes wrong here, just continue with the normal flow.
+        pass
+
     # Inspect streams
     streams = probe.get("streams", [])
     has_video = any(s.get("codec_type") == "video" for s in streams)
