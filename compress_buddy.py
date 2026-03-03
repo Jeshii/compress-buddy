@@ -1942,8 +1942,36 @@ def main(argv):
                     # Now process the joined file (by default we plan to process it)
                     files = [str(joined_path)]
                     quick_joined_path = Path(joined_path)
-                    # By default, mark this as an intermediate we will delete on exit
-                    quick_join_delete_on_exit = True
+                    # Determine whether the joined file is the intended final output.
+                    try:
+                        if getattr(args, "output_file", None):
+                            out_for_join = Path(args.output_file)
+                        elif getattr(args, "output_is_dir", False):
+                            out_for_join = (
+                                Path(args.output)
+                                / joined_path.with_suffix(f".{args.suffix}").name
+                            )
+                        else:
+                            out_for_join = joined_path.with_suffix(f".{args.suffix}")
+
+                        same_output = False
+                        try:
+                            same_output = out_for_join.resolve() == joined_path.resolve()
+                        except Exception:
+                            same_output = str(out_for_join) == str(joined_path)
+
+                        if same_output:
+                            # This joined file is the final output, keep it.
+                            quick_join_delete_on_exit = False
+                            if not args.overwrite:
+                                LOG.info(
+                                    "Joined output equals processing output, skipping processing to avoid overwrite"
+                                )
+                                args.skip_processing = True
+                        else:
+                            quick_join_delete_on_exit = True
+                    except Exception:
+                        quick_join_delete_on_exit = True
                 else:
                     LOG.info(
                         f"(dry-run) Would join {len(files)} files into {joined_path}"
