@@ -717,6 +717,30 @@ def map_quality_to_crf(q):
     return max(0, min(51, crf))
 
 
+def codec_family(name):
+    """Map an ffmpeg codec name onto a broad family for cross-codec comparison.
+
+    Substring matching means concrete encoder tokens resolve too, so
+    `libx265`, `hevc_videotoolbox` and plain `h265` are all reported as
+    `hevc`. Returns None for anything unrecognised so callers can fall back
+    to their own default rather than assuming a match.
+    """
+    n = (name or "").lower()
+    if not n:
+        return None
+    if "hevc" in n or "h265" in n or "x265" in n or "265" in n:
+        return "hevc"
+    if "h264" in n or "avc" in n or "x264" in n or "264" in n:
+        return "h264"
+    if "av1" in n:
+        return "av1"
+    if "vp9" in n:
+        return "vp9"
+    if "vp8" in n:
+        return "vp8"
+    return None
+
+
 def run_ffmpeg_with_progress(cmd: list, total_duration: float = None) -> tuple:
     """
     Run ffmpeg with '-progress pipe:1 -nostats' already present in cmd.
@@ -1300,16 +1324,18 @@ def process_file(path, args):
     except Exception:
         target_kbps = int(max(300, base_target * scale_multiplier))
 
-    # Apply min/max caps and ensure we never target higher than source bitrate
+    # Apply min/max caps.
+    #
+    # Deliberately no `min(source_kbps, target_kbps)` clamp here. Clamping to
+    # the source bitrate made the skip check below unreachable (the target
+    # could then never exceed the source), and it also truncated to an int
+    # while the comparison used a float, so a 5000.7 kbps source clamped to
+    # 5000 and failed `5000 >= 5000.7`, re-encoding at exactly source
+    # bitrate instead of skipping.
     if args.min_kbps is not None:
         target_kbps = max(int(args.min_kbps), target_kbps)
     if args.max_kbps is not None:
         target_kbps = min(int(args.max_kbps), target_kbps)
-    try:
-        if bitrate is not None:
-            target_kbps = min(int(bitrate / 1000.0), target_kbps)
-    except Exception:
-        pass
 
     LOG.info(
         "%s: duration=%.1fs source=%.0f kbps -> target=%d kbps",
@@ -1322,15 +1348,39 @@ def process_file(path, args):
     # If the final target bitrate is greater than or equal to the source
     # bitrate, there's no benefit in re-encoding — skip to avoid quality
     # loss and wasted work.
+    #
+    # Exception: sources that are already AV1/VP9/VP8 are never skipped,
+    # because those codecs reach a given quality at a much lower bitrate
+    # than H.264/HEVC. Bitrates are not comparable across families, so a
+    # target at or above the source bitrate can still be a real saving when
+    # transcoding to a different family. The comparison is deliberately
+    # broad: any family change exempts the file, not just AV1->H.264/HEVC.
+    #
+    # This depends on the source-bitrate cap above NOT being applied: if we
+    # clamp the target back down to the source bitrate first, the comparison
+    # below can never fire and the exemption is silently defeated.
     try:
         if bitrate is not None and target_kbps >= source_kbps:
-            LOG.info(
-                "%s: target (%d kbps) >= source (%.0f kbps); skipping encode",
-                inp.name,
-                target_kbps,
-                source_kbps,
-            )
-            return
+            skip_encode = True
+            try:
+                for s in probe.get("streams", []):
+                    if s.get("codec_type") != "video":
+                        continue
+                    src_fam = codec_family(s.get("codec_name"))
+                    tgt_fam = codec_family(getattr(args, "codec", None))
+                    if src_fam and tgt_fam and src_fam != tgt_fam:
+                        skip_encode = False
+                    break
+            except Exception:
+                pass
+            if skip_encode:
+                LOG.info(
+                    "%s: target (%d kbps) >= source (%.0f kbps); skipping encode",
+                    inp.name,
+                    target_kbps,
+                    source_kbps,
+                )
+                return
     except Exception:
         # If anything goes wrong here, just continue with the normal flow.
         pass
