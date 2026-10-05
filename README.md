@@ -62,6 +62,16 @@ Join multiple inputs:
 python3 compress_buddy.py --join -o /tmp/outdir part1.mov part2.mov
 ```
 
+Recursively compress a directory tree:
+
+```bash
+python3 compress_buddy.py -r -o /path/to/outdir /path/to/videos
+```
+
+We recommend passing `-o` with recursive runs. Without it, each output is written next to its source file, which interleaves results with originals. Combine with `--dry-run` first to preview which files would be processed.
+
+Note that `-o` flattens the directory structure: outputs are named after the source file's basename, so two files named `clip.mov` in different subdirectories will collide and the second is skipped with a warning. Leave `-o` off if you need the tree preserved.
+
 ## Options
 
 General
@@ -92,6 +102,11 @@ Scaling
 - `--max-height <px>` — maximum output height in pixels (preserves aspect ratio).
 - If only one of `--max-width`/`--max-height` is provided, we infer the other from the input aspect ratio.
 
+Input
+- `--recursive`, `-r` — recurse into directories to find input files. Required when passing a directory: without it, a directory argument is logged and skipped.
+- `--extensions <list>` — comma-separated file extensions to include when recursing (no dots). Default: `mp4,mov,mkv,webm,avi,m4v,mpg,mpeg,ts`.
+- Shell-style globs (`*`, `?`, `[`) are expanded, so `*.mp4` and `**/*.mov` also work. Combine with `-r` to expand globs recursively.
+
 Output
 - `--output, -o <DIR>` — output directory (place converted files here).
 - `--chunk-minutes <N>` — split output into N-minute segments. Segments are written to a temporary directory next to the output and then moved into place after encoding.
@@ -120,6 +135,7 @@ Notes
 - Byte display: sizes shown by the tool use IEC binary units (`KiB`, `MiB`, `GiB`) which are based on 1024 bytes. This makes it explicit that values like `2.59 GiB` are using 1024-based math and explains apparent differences with Finder which often reports decimal GB.
 - Bitrate cap: the computed target bitrate is capped to the original source bitrate (as reported by ffprobe) so we will never intentionally target a bitrate higher than the source. If ffprobe cannot determine the source bitrate, the tool will continue to ask you to provide explicit `--min-kbps`/`--max-kbps` or accept defaults.
 - Chunking: segments are written to a temporary directory next to the output and moved into place after encoding. If the process fails mid-run, partial files may need manual cleanup.
+- Output placement: by default each output sits next to its source file with `--suffix` applied. With `-o`, all outputs are written into that single directory using the source basename, so same-named files from different subdirectories collide and the later one is skipped (use `--overwrite` to replace). Recursive runs that need the directory tree preserved should omit `-o`.
 - Destructive flags: `--overwrite` and `--delete-original` will replace or remove files — use with caution.
 
 ## Codec / Encoder selection
